@@ -4,10 +4,36 @@
 #include <utils/button.h>
 
 #include <PacketSerial.h>
+#include <BLEDevice.h>
+#include <BLEServer.h>
+#include <BLEUtils.h>
+#include <BLE2902.h>
 
 PacketSerial packetSerial;
 
 #include "openbikesensor.pb.h"
+
+// --- BLE Setup ---
+
+// UUIDs für Service & TX-Characteristic (Notify -> iPhone)
+#define OBS_BLE_SERVICE_UUID "6e400001-b5a3-f393-e0a9-e50e24dcca9e"
+#define OBS_BLE_CHAR_TX_UUID "6e400003-b5a3-f393-e0a9-e50e24dcca9e"
+
+BLEServer*        obsBleServer  = nullptr;
+BLECharacteristic* obsBleTxChar = nullptr;
+bool obsBleDeviceConnected      = false;
+
+class ObsBleServerCallbacks : public BLEServerCallbacks {
+    void onConnect(BLEServer* pServer) override {
+        obsBleDeviceConnected = true;
+    }
+
+    void onDisconnect(BLEServer* pServer) override {
+        obsBleDeviceConnected = false;
+        // Wieder Werbung starten, damit ein iPhone neu verbinden kann
+        pServer->startAdvertising();
+    }
+};
 
 // Button config
 const int PUSHBUTTON_PIN = 2;
@@ -16,6 +42,18 @@ Button button(PUSHBUTTON_PIN);
 
 uint8_t pb_buffer[1024];
 pb_ostream_t pb_ostream;
+
+// gemeinsame Funktion: Protobuf-Event über USB-Serial UND BLE senden
+void send_event_bytes(uint8_t* data, size_t len) {
+    // 1) wie bisher über PacketSerial (USB)
+    packetSerial.send(data, len);
+
+    // 2) zusätzlich als BLE-Notification
+    if (obsBleDeviceConnected && obsBleTxChar != nullptr) {
+        obsBleTxChar->setValue(data, len);
+        obsBleTxChar->notify();
+    }
+}
 
 bool _write_string(pb_ostream_t* stream, const pb_field_iter_t* field, void* const* arg) {
     String& str = *((String*)(*arg));
@@ -26,6 +64,7 @@ bool _write_string(pb_ostream_t* stream, const pb_field_iter_t* field, void* con
 
     return pb_encode_string(stream, (uint8_t*)str.c_str(), str.length());
 }
+
 void write_string(pb_callback_t& target, String& str) {
     target.arg = &str;
     target.funcs.encode = &_write_string;
@@ -53,7 +92,7 @@ void send_text_message(String message, openbikesensor_TextMessage_Type type = op
     // write out
     pb_ostream = pb_ostream_from_buffer(pb_buffer, sizeof(pb_buffer));
     pb_encode(&pb_ostream, &openbikesensor_Event_msg, &event);
-    packetSerial.send(pb_buffer, pb_ostream.bytes_written);
+    send_event_bytes(pb_buffer, pb_ostream.bytes_written);
 }
 
 void send_distance_measurement(uint32_t source_id, float distance, uint64_t time_of_flight) {
@@ -79,7 +118,7 @@ void send_distance_measurement(uint32_t source_id, float distance, uint64_t time
     // write out
     pb_ostream = pb_ostream_from_buffer(pb_buffer, sizeof(pb_buffer));
     pb_encode(&pb_ostream, &openbikesensor_Event_msg, &event);
-    packetSerial.send(pb_buffer, pb_ostream.bytes_written);
+    send_event_bytes(pb_buffer, pb_ostream.bytes_written);
 }
 
 void send_button_press() {
@@ -104,7 +143,7 @@ void send_button_press() {
     // write out
     pb_ostream = pb_ostream_from_buffer(pb_buffer, sizeof(pb_buffer));
     pb_encode(&pb_ostream, &openbikesensor_Event_msg, &event);
-    packetSerial.send(pb_buffer, pb_ostream.bytes_written);
+    send_event_bytes(pb_buffer, pb_ostream.bytes_written);
 }
 
 void send_heartbeat() {
@@ -122,7 +161,7 @@ void send_heartbeat() {
     // write out
     pb_ostream = pb_ostream_from_buffer(pb_buffer, sizeof(pb_buffer));
     pb_encode(&pb_ostream, &openbikesensor_Event_msg, &event);
-    packetSerial.send(pb_buffer, pb_ostream.bytes_written);
+    send_event_bytes(pb_buffer, pb_ostream.bytes_written);
 }
 
 class SensorMeasurement {
@@ -144,10 +183,11 @@ public:
 
 class Sensor {
 public:
-    Sensor(uint8_t source_id_, uint8_t _trigger_pin, uint8_t _echo_pin) : source_id(source_id_),
+    Sensor(uint8_t source_id_, uint8_t _trigger_pin, uint8_t _echo_pin) :
+        source_id(source_id_),
         trigger_pin(_trigger_pin),
-        echo_pin(_echo_pin) {    
-}
+        echo_pin(_echo_pin) {
+    }
 
     void begin(void interrupt_echo()) {
         pinMode(echo_pin, INPUT_PULLUP);
@@ -200,7 +240,7 @@ public:
                 slave.triggered = now;
                 slave.timeout_at = timeout_at - min_delay;
                 digitalWrite(slave.trigger_pin, HIGH);
-            } 
+            }
             digitalWrite(trigger_pin, HIGH);
 
             delayMicroseconds(15);
@@ -284,6 +324,30 @@ Timer heartbeat(1000);
 void setup() {
     packetSerial.begin(115200);
 
+    // --- BLE initialisieren ---
+    BLEDevice::init("OpenBikeSensor");   // Name, der auf dem iPhone angezeigt wird
+
+    obsBleServer = BLEDevice::createServer();
+    obsBleServer->setCallbacks(new ObsBleServerCallbacks());
+
+    BLEService* obsService = obsBleServer->createService(OBS_BLE_SERVICE_UUID);
+
+    obsBleTxChar = obsService->createCharacteristic(
+        OBS_BLE_CHAR_TX_UUID,
+        BLECharacteristic::PROPERTY_NOTIFY
+    );
+    obsBleTxChar->addDescriptor(new BLE2902());   // wichtig für iOS Notifications
+
+    obsService->start();
+
+    BLEAdvertising* advertising = BLEDevice::getAdvertising();
+    advertising->addServiceUUID(OBS_BLE_SERVICE_UUID);
+    advertising->setScanResponse(true);
+    advertising->setMinPreferred(0x06);
+    advertising->setMaxPreferred(0x12);
+    BLEDevice::startAdvertising();
+    // --- Ende BLE-Init ---
+
     sensors[0].begin(interrupt_sensor0);
     sensors[1].begin(interrupt_sensor1);
 
@@ -302,7 +366,7 @@ void loop() {
         heartbeat.start();
     }
 
-    // read all measurements and send them via serial
+    // read all measurements and send them via serial / BLE
     for (uint8_t i = 0; i < sensors_length; i++) {
         Sensor& sensor = sensors[i];
 
