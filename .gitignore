@@ -1,2 +1,31 @@
-.pio
+# --- macOS ---
 .DS_Store
+.AppleDouble
+.LSOverride
+.Spotlight-V100
+.Trashes
+
+# --- PlatformIO ---
+.pio/
+.vscode/
+.pioenvs/
+.piolibdeps/
+
+# --- Build artifacts ---
+*.o
+*.a
+*.elf
+*.bin
+*.map
+
+# --- Logs ---
+*.log
+
+# --- Editor / IDE ---
+.idea/
+*.swp
+*.swo
+
+# --- OS / misc ---
+Thumbs.db
+
