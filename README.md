@@ -6,6 +6,15 @@ If you are looking for the firmware for the existing, "Classic" OpenBikeSensor, 
 
 The OpenBikeSensor Lite is currently in development and not available to build yet. There are no build instructions, and this firmware, the recording software, data format and enclosure are not completed. Please go over to the [OpenBikeSensor Website](https://www.openbikesensor.org/docs/hardware/) if you're interested in building your own device, it contains all information for the Classic version of the OpenBikeSensor.
 
+## BLE-Datenstream (dieser Fork)
+
+Dieser Fork streamt OpenBikeSensor-Events über **Bluetooth Low Energy (BLE)** mittels GATT-Notifications.
+
+### BLE-Gerät
+- Advertising-Name: `OpenBikeSensor`
+- Service UUID: `6e400001-b5a3-f393-e0a9-e50e24dcca9e`
+- TX-Characteristic UUID (Notify): `6e400003-b5a3-f393-e0a9-e50e24dcca9e`
+
 ## Building
 
 Required: 
