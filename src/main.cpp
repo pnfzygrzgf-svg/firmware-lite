@@ -15,6 +15,76 @@
 
 PacketSerial packetSerial;
 
+// ===== UNIX time helper (real unix if set, else build time + uptime) =====
+#include <time.h>
+#include <sys/time.h>
+#include <esp_timer.h>
+#include <stdlib.h>
+#include <string.h>
+
+static int _month_from_str(const char* m) {
+  if (!strncmp(m, "Jan", 3)) return 0;
+  if (!strncmp(m, "Feb", 3)) return 1;
+  if (!strncmp(m, "Mar", 3)) return 2;
+  if (!strncmp(m, "Apr", 3)) return 3;
+  if (!strncmp(m, "May", 3)) return 4;
+  if (!strncmp(m, "Jun", 3)) return 5;
+  if (!strncmp(m, "Jul", 3)) return 6;
+  if (!strncmp(m, "Aug", 3)) return 7;
+  if (!strncmp(m, "Sep", 3)) return 8;
+  if (!strncmp(m, "Oct", 3)) return 9;
+  if (!strncmp(m, "Nov", 3)) return 10;
+  if (!strncmp(m, "Dec", 3)) return 11;
+  return 0;
+}
+
+static time_t _build_epoch_utc() {
+  const char* date = __DATE__;  // "Mmm dd yyyy"
+  const char* time_ = __TIME__; // "hh:mm:ss"
+
+  struct tm tm_ {};
+  tm_.tm_isdst = 0;
+
+  char mon[4] = {date[0], date[1], date[2], 0};
+  tm_.tm_mon  = _month_from_str(mon);
+  tm_.tm_mday = atoi(date + 4);
+  tm_.tm_year = atoi(date + 7) - 1900;
+
+  tm_.tm_hour = atoi(time_ + 0);
+  tm_.tm_min  = atoi(time_ + 3);
+  tm_.tm_sec  = atoi(time_ + 6);
+
+  setenv("TZ", "UTC0", 1);
+  tzset();
+  return mktime(&tm_);
+}
+
+static uint64_t unix_time_us_now() {
+  struct timeval tv;
+  gettimeofday(&tv, nullptr);
+
+  // plausible unix time (after ~2023-11)
+  if (tv.tv_sec > 1700000000) {
+    return (uint64_t)tv.tv_sec * 1000000ULL + (uint64_t)tv.tv_usec;
+  }
+
+  static const time_t build_epoch = _build_epoch_utc();
+  const uint64_t boot_us = (uint64_t)esp_timer_get_time(); // µs since boot
+  return (uint64_t)build_epoch * 1000000ULL + boot_us;
+}
+
+// time_source_id is the time source identifier (NOT left/right sensor id)
+static inline openbikesensor_Time make_unix_time_obs(int32_t time_source_id = 1) {
+  const uint64_t us = unix_time_us_now();
+
+  openbikesensor_Time t = openbikesensor_Time_init_zero;
+  t.source_id   = time_source_id;
+  t.reference   = openbikesensor_Time_Reference_UNIX;
+  t.seconds     = (int64_t)(us / 1000000ULL);
+  t.nanoseconds = (int32_t)((us % 1000000ULL) * 1000ULL);
+  return t;
+}
+
 // ======================== BLE UUIDs (Lite) ========================
 #define OBS_BLE_SERVICE_UUID "6e400001-b5a3-f393-e0a9-e50e24dcca9e"
 #define OBS_BLE_CHAR_TX_UUID "6e400003-b5a3-f393-e0a9-e50e24dcca9e"
@@ -90,11 +160,7 @@ static inline bool encode_and_send(openbikesensor_Event& event) {
 
 // ======================== OBS message helpers ========================
 static inline openbikesensor_Time make_cpu_time() {
-  openbikesensor_Time cpu_time = openbikesensor_Time_init_zero;
-  uint32_t us = micros();
-  cpu_time.seconds = us / 1000000;
-  cpu_time.nanoseconds = (us % 1000000) * 1000;
-  return cpu_time;
+  return make_unix_time_obs(1);
 }
 
 void send_text_message(String message, openbikesensor_TextMessage_Type type = openbikesensor_TextMessage_Type_INFO) {
@@ -226,17 +292,11 @@ bool readTfLunaFrame(float& distance_m, uint16_t& strength, float& temp_c) {
 }
 
 // ======================== Device Info strings ========================
-// Das ist der Name, den iOS „ohne Details“ direkt anzeigt (LocalName / Geräte-Name)
 static const char* DEV_LOCAL_NAME   = "OBS Lite LiDAR";
-
-// Diese beiden sieht man typischerweise in „Details anzeigen“ (Device Info Service)
 static const char* DEV_MANUFACTURER = "OpenBikeSensor";
 static const char* DEV_FW_REV       = "OBS-Lite-LiDAR";
 
-
 // ======================== Dummy right sensor ========================
-// Muss konstant sein; < 5m damit die App ihn auch als "gültig" ansieht.
-// Wenn du ihn NICHT angezeigt haben willst, nimm z.B. 9.9 oder 99.0.
 static constexpr float DUMMY_RIGHT_METERS = 2.33f;
 
 // Status 1x/s
