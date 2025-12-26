@@ -13,6 +13,76 @@ PacketSerial packetSerial;
 
 #include "openbikesensor.pb.h"
 
+// ===== UNIX time helper (real unix if set, else build time + uptime) =====
+#include <time.h>
+#include <sys/time.h>
+#include <esp_timer.h>
+#include <stdlib.h>
+#include <string.h>
+
+static int _month_from_str(const char* m) {
+  if (!strncmp(m, "Jan", 3)) return 0;
+  if (!strncmp(m, "Feb", 3)) return 1;
+  if (!strncmp(m, "Mar", 3)) return 2;
+  if (!strncmp(m, "Apr", 3)) return 3;
+  if (!strncmp(m, "May", 3)) return 4;
+  if (!strncmp(m, "Jun", 3)) return 5;
+  if (!strncmp(m, "Jul", 3)) return 6;
+  if (!strncmp(m, "Aug", 3)) return 7;
+  if (!strncmp(m, "Sep", 3)) return 8;
+  if (!strncmp(m, "Oct", 3)) return 9;
+  if (!strncmp(m, "Nov", 3)) return 10;
+  if (!strncmp(m, "Dec", 3)) return 11;
+  return 0;
+}
+
+static time_t _build_epoch_utc() {
+  const char* date = __DATE__;  // "Mmm dd yyyy"
+  const char* time_ = __TIME__; // "hh:mm:ss"
+
+  struct tm tm_ {};
+  tm_.tm_isdst = 0;
+
+  char mon[4] = {date[0], date[1], date[2], 0};
+  tm_.tm_mon  = _month_from_str(mon);
+  tm_.tm_mday = atoi(date + 4);
+  tm_.tm_year = atoi(date + 7) - 1900;
+
+  tm_.tm_hour = atoi(time_ + 0);
+  tm_.tm_min  = atoi(time_ + 3);
+  tm_.tm_sec  = atoi(time_ + 6);
+
+  setenv("TZ", "UTC0", 1);
+  tzset();
+  return mktime(&tm_);
+}
+
+static uint64_t unix_time_us_now() {
+  struct timeval tv;
+  gettimeofday(&tv, nullptr);
+
+  // plausible unix time (after ~2023-11)
+  if (tv.tv_sec > 1700000000) {
+    return (uint64_t)tv.tv_sec * 1000000ULL + (uint64_t)tv.tv_usec;
+  }
+
+  static const time_t build_epoch = _build_epoch_utc();
+  const uint64_t boot_us = (uint64_t)esp_timer_get_time(); // µs since boot
+  return (uint64_t)build_epoch * 1000000ULL + boot_us;
+}
+
+// time_source_id is the time source identifier (NOT left/right sensor id)
+static inline openbikesensor_Time make_unix_time_obs(int32_t time_source_id = 1) {
+  const uint64_t us = unix_time_us_now();
+
+  openbikesensor_Time t = openbikesensor_Time_init_zero;
+  t.source_id   = time_source_id;
+  t.reference   = openbikesensor_Time_Reference_UNIX;
+  t.seconds     = (int64_t)(us / 1000000ULL);
+  t.nanoseconds = (int32_t)((us % 1000000ULL) * 1000ULL);
+  return t;
+}
+
 // --- BLE Setup ---
 
 // UUIDs für Service & TX-Characteristic (Notify -> iPhone)
@@ -74,11 +144,8 @@ void write_string(pb_callback_t& target, String& str) {
 }
 
 void send_text_message(String message, openbikesensor_TextMessage_Type type = openbikesensor_TextMessage_Type_INFO) {
-  // create the time
-  openbikesensor_Time cpu_time = openbikesensor_Time_init_zero;
-  uint32_t us = micros();
-  cpu_time.seconds = us / 1000000;
-  cpu_time.nanoseconds = (us % 1000000) * 1000;
+  // create the time (UNIX)
+  openbikesensor_Time cpu_time = make_unix_time_obs(1);
 
   // create the text message
   openbikesensor_TextMessage msg = openbikesensor_TextMessage_init_zero;
@@ -99,11 +166,8 @@ void send_text_message(String message, openbikesensor_TextMessage_Type type = op
 }
 
 void send_distance_measurement(uint32_t source_id, float distance, uint64_t time_of_flight) {
-  // create the time
-  openbikesensor_Time cpu_time = openbikesensor_Time_init_zero;
-  uint32_t us = micros();
-  cpu_time.seconds = us / 1000000;
-  cpu_time.nanoseconds = (us % 1000000) * 1000;
+  // create the time (UNIX)
+  openbikesensor_Time cpu_time = make_unix_time_obs(1);
 
   // create the distance measurement
   openbikesensor_DistanceMeasurement distance_measurement = openbikesensor_DistanceMeasurement_init_zero;
@@ -125,11 +189,8 @@ void send_distance_measurement(uint32_t source_id, float distance, uint64_t time
 }
 
 void send_button_press() {
-  // create the time
-  openbikesensor_Time cpu_time = openbikesensor_Time_init_zero;
-  uint32_t us = micros();
-  cpu_time.seconds = us / 1000000;
-  cpu_time.nanoseconds = (us % 1000000) * 1000;
+  // create the time (UNIX)
+  openbikesensor_Time cpu_time = make_unix_time_obs(1);
 
   openbikesensor_UserInput user_input = openbikesensor_UserInput_init_zero;
   user_input.type = openbikesensor_UserInput_Type_OVERTAKER;
@@ -150,11 +211,8 @@ void send_button_press() {
 }
 
 void send_heartbeat() {
-  // create the time
-  openbikesensor_Time cpu_time = openbikesensor_Time_init_zero;
-  uint32_t us = micros();
-  cpu_time.seconds = us / 1000000;
-  cpu_time.nanoseconds = (us % 1000000) * 1000;
+  // create the time (UNIX)
+  openbikesensor_Time cpu_time = make_unix_time_obs(1);
 
   // create the event
   openbikesensor_Event event = openbikesensor_Event_init_zero;
