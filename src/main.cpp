@@ -219,13 +219,20 @@ class Timer {
 public:
   Timer(uint32_t delay_) : delay(delay_) {}
   void start() { trigger_at = millis() + delay; }
+
+  // FIX: wrap-safe check for millis() overflow
   bool check() {
-    if (trigger_at != 0 && trigger_at <= millis()) {
-      trigger_at = 0;
-      return true;
+    if (trigger_at != 0) {
+      uint32_t now = millis();
+      // wrap-safe: true if now is after-or-equal trigger_at
+      if ((int32_t)(now - trigger_at) >= 0) {
+        trigger_at = 0;
+        return true;
+      }
     }
     return false;
   }
+
 private:
   uint32_t trigger_at = 0;
   uint32_t delay;
