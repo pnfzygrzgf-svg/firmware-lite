@@ -244,6 +244,20 @@ float           lidar_distance_m = -1.0f;
 uint16_t        lidar_strength   = 0;
 float           lidar_temp_c     = 0.0f;
 
+// ===== Quality / health handling (PATCH 1) =====
+static constexpr uint16_t AMP_MIN_VALID  = 100;
+static constexpr uint16_t AMP_OVEREXPOSE = 65535;
+
+// Wenn länger keine Frames kommen: Sensor "stale"
+static constexpr uint32_t LIDAR_STALE_MS = 600;
+
+// Warnungen nicht spammen
+static constexpr uint32_t WARN_COOLDOWN_MS = 30000;
+static uint32_t lastWarnMs  = 0;
+
+// Zeitpunkt des letzten erfolgreich geparsten Frames
+static uint32_t lastFrameMs = 0;
+
 // Parser: 0x59 0x59 header, 9 bytes total, checksum ok
 bool readTfLunaFrame(float& distance_m, uint16_t& strength, float& temp_c) {
   static uint8_t buf[9];
@@ -279,7 +293,8 @@ bool readTfLunaFrame(float& distance_m, uint16_t& strength, float& temp_c) {
       uint16_t tempRaw = (uint16_t)buf[6] | ((uint16_t)buf[7] << 8);
       temp_c = ((float)tempRaw) / 8.0f - 256.0f;
 
-      if (strength < 100 || dist_cm == 0 || dist_cm == 0xFFFF) {
+      // PATCH 2: Overexposure ebenfalls als ungültig behandeln
+      if (strength < AMP_MIN_VALID || strength == AMP_OVEREXPOSE || dist_cm == 0 || dist_cm == 0xFFFF) {
         distance_m = -1.0f;
       } else {
         distance_m = (float)dist_cm / 100.0f;
@@ -371,6 +386,23 @@ void loop() {
     lidar_strength   = s;
     lidar_temp_c     = t_c;
     lidar_has_value  = true;
+
+    // PATCH 3: Zeitpunkt des letzten Frames merken (für "stale" Erkennung)
+    lastFrameMs      = millis();
+  }
+
+  // PATCH 3: Wenn lange kein Frame kam -> nicht alte Werte "festhalten"
+  uint32_t nowMs = millis();
+  if (lidar_has_value && (nowMs - lastFrameMs > LIDAR_STALE_MS)) {
+    lidar_has_value = false;
+    lidar_distance_m = -1.0f;
+    lidar_strength = 0;
+
+    // optional: Warnung (rate-limited)
+    if (nowMs - lastWarnMs > WARN_COOLDOWN_MS) {
+      send_text_message("LiDAR: no frames (UART timeout) - check wiring/power", openbikesensor_TextMessage_Type_WARNING);
+      lastWarnMs = nowMs;
+    }
   }
 
   // 2) Heartbeat
@@ -381,21 +413,16 @@ void loop() {
 
   // 3) LiDAR senden (links) + Dummy rechts konstant
   if (lidarSendTimer.check()) {
-    float leftMeters = 99.0f;
-    uint64_t leftTofNs = 0;
+    // PATCH 4: IMPORTER-SICHER: IMMER senden, bei ungültig mit großem Sentinelwert.
+    float leftMeters = 99.0f; // "kein Messwert" -> stört min() im Import nicht
 
+    // Nur wenn ein gültiger Messwert da ist, echten Abstand senden.
     if (lidar_has_value && lidar_distance_m > 0.0f) {
       leftMeters = lidar_distance_m;
-
-      // konservativ, ähnlich Ultraschall-Feeling (nicht Lichtgeschwindigkeit)
-      const double speedOfSound = 343.0;
-      leftTofNs = (uint64_t)((2.0 * (double)leftMeters / speedOfSound) * 1e9);
     }
 
-    // source_id=1: links (overtaker)
-    send_distance_measurement(1, leftMeters, leftTofNs);
-
-    // source_id=2: rechts (dummy konstant, damit Import/Window nicht leer)
+    // PATCH 1/4: ToF nicht berechnen -> 0 senden
+    send_distance_measurement(1, leftMeters, 0);
     send_distance_measurement(2, DUMMY_RIGHT_METERS, 0);
 
     lidarSendTimer.start();
@@ -411,10 +438,11 @@ void loop() {
   uint32_t now = millis();
   if (now - lastStatusMs >= 1000) {
     lastStatusMs = now;
-    Serial.printf("Status: BLE=%s last_len=%lu LiDAR=%.2fm dummyR=%.2fm\n",
+    Serial.printf("Status: BLE=%s last_len=%lu LiDAR=%.2fm Amp=%u dummyR=%.2fm\n",
                   obsBleDeviceConnected ? "ON" : "OFF",
                   (unsigned long)g_last_send_len,
                   (double)lidar_distance_m,
+                  (unsigned)lidar_strength,
                   (double)DUMMY_RIGHT_METERS);
   }
 }
