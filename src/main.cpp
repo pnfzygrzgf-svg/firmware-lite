@@ -3,35 +3,55 @@
 #include <pb_decode.h>
 #include <utils/button.h>
 
-#include <PacketSerial.h>
 #include <BLEDevice.h>
 #include <BLEServer.h>
 #include <BLEUtils.h>
 #include <BLE2902.h>
 
 #include <HardwareSerial.h>
-#include <esp_timer.h>   // 64-bit uptime (µs since boot)
+#include <esp_timer.h>   // esp_timer_get_time(): 64-bit uptime (µs since boot)
 
 #include "openbikesensor.pb.h"
 
-// =============================================================================
-// Overview
-// - ESP32 sends OpenBikeSensor protobuf Events via BLE notify (Nordic UART style)
-// - Time is monotonic uptime (esp_timer_get_time) -> reference = ARBITRARY
-// - TF-Luna via UART provides left distance; right side is a constant dummy value
-// - Heartbeat 1 Hz, distance 10 Hz, button sends UserInput events
-// =============================================================================
+// ============================================================================
+// OBS Lite LiDAR Firmware (clean)
+// - Sends OpenBikeSensor protobuf Events via BLE notify (Nordic UART style)
+// - Time: monotonic uptime -> reference = ARBITRARY (no fake UNIX time)
+// - TF-Luna on UART provides LEFT distance
+// - RIGHT distance is a constant dummy value
+// - Heartbeat: 1 Hz
+// - Distance: 10 Hz
+// - Button: sends UserInput event
+// ============================================================================
 
-PacketSerial packetSerial; // optional (USB framing), currently unused for TX
+// ------------------------- Device info strings -------------------------
+static constexpr const char* DEV_LOCAL_NAME   = "OBS Lite LiDAR";
+static constexpr const char* DEV_MANUFACTURER = "OpenBikeSensor";
+static constexpr const char* DEV_FW_REV       = "OBS-Lite-LiDAR";
 
-// =============================================================================
+// ------------------------- BLE UUIDs (OBS Lite / Nordic UART style) ----
+static constexpr const char* OBS_BLE_SERVICE_UUID = "6e400001-b5a3-f393-e0a9-e50e24dcca9e";
+static constexpr const char* OBS_BLE_CHAR_TX_UUID = "6e400003-b5a3-f393-e0a9-e50e24dcca9e";
+
+// ------------------------- Hardware pins -------------------------------
+static constexpr int PUSHBUTTON_PIN = 2;
+
+static constexpr int TF_LUNA_RX_PIN = 16;
+static constexpr int TF_LUNA_TX_PIN = 17;
+
+// ------------------------- Protobuf buffer -----------------------------
+static constexpr size_t PB_BUFFER_SIZE = 1024;
+static uint8_t      pb_buffer[PB_BUFFER_SIZE];
+static pb_ostream_t pb_ostream;
+
+// ============================================================================
 // Time (Uptime only) correct semantic: ARBITRARY
-// =============================================================================
+// ============================================================================
 static inline openbikesensor_Time make_obs_time(int32_t time_source_id = 1) {
   const uint64_t us = (uint64_t)esp_timer_get_time();
 
   openbikesensor_Time t = openbikesensor_Time_init_zero;
-  t.source_id   = time_source_id; // your convention: 1 = internal CPU clock
+  t.source_id   = time_source_id; // convention: 1 = internal CPU clock
   t.reference   = openbikesensor_Time_Reference_ARBITRARY;
   t.seconds     = (int64_t)(us / 1000000ULL);
   t.nanoseconds = (int32_t)((us % 1000000ULL) * 1000ULL);
@@ -39,67 +59,51 @@ static inline openbikesensor_Time make_obs_time(int32_t time_source_id = 1) {
 }
 static inline openbikesensor_Time make_cpu_time() { return make_obs_time(1); }
 
-// =============================================================================
-// BLE UUIDs (Lite / Nordic UART style)
-// =============================================================================
-#define OBS_BLE_SERVICE_UUID "6e400001-b5a3-f393-e0a9-e50e24dcca9e"
-#define OBS_BLE_CHAR_TX_UUID "6e400003-b5a3-f393-e0a9-e50e24dcca9e"
-
-BLEServer*         obsBleServer  = nullptr;
-BLECharacteristic* obsBleTxChar  = nullptr;
-volatile bool      obsBleDeviceConnected = false;
+// ============================================================================
+// BLE state
+// ============================================================================
+BLEServer*         g_bleServer  = nullptr;
+BLECharacteristic* g_bleTxChar  = nullptr;
+volatile bool      g_bleConnected = false;
 
 class ObsBleServerCallbacks : public BLEServerCallbacks {
-  void onConnect(BLEServer* pServer) override {
-    (void)pServer;
-    obsBleDeviceConnected = true;
+  void onConnect(BLEServer* s) override {
+    (void)s;
+    g_bleConnected = true;
     Serial.println("BLE: connected");
   }
-  void onDisconnect(BLEServer* pServer) override {
-    obsBleDeviceConnected = false;
+  void onDisconnect(BLEServer* s) override {
+    g_bleConnected = false;
     Serial.println("BLE: disconnected -> advertising");
-    pServer->startAdvertising();
+    s->startAdvertising();
   }
 };
 
-// =============================================================================
-// Device Info strings (Device Information Service)
-// =============================================================================
-static const char* DEV_LOCAL_NAME   = "OBS Lite LiDAR";
-static const char* DEV_MANUFACTURER = "OpenBikeSensor";
-static const char* DEV_FW_REV       = "OBS-Lite-LiDAR";
-
-// =============================================================================
+// ============================================================================
 // Button
-// =============================================================================
-const int PUSHBUTTON_PIN = 2;
+// ============================================================================
 Button button(PUSHBUTTON_PIN);
 
-// =============================================================================
-// Protobuf encode buffer
-// =============================================================================
-static uint8_t      pb_buffer[1024];
-static pb_ostream_t pb_ostream;
-
-// =============================================================================
+// ============================================================================
 // BLE send helper
-// =============================================================================
+// - Sends one protobuf Event as a single BLE notify.
+// - delay(1) gives BLE stack a tiny bit of time under frequent notifications.
+// ============================================================================
 static uint32_t g_last_send_len = 0;
 
 static inline void send_event_bytes(const uint8_t* data, size_t len) {
   g_last_send_len = (uint32_t)len;
 
-  if (obsBleDeviceConnected && obsBleTxChar != nullptr) {
-    // BLECharacteristic::setValue takes non-const pointer
-    obsBleTxChar->setValue((uint8_t*)data, len);
-    obsBleTxChar->notify();
-    delay(1); // tiny yield helps BLE stack under frequent notifications
+  if (g_bleConnected && g_bleTxChar != nullptr) {
+    g_bleTxChar->setValue((uint8_t*)data, len);
+    g_bleTxChar->notify();
+    delay(1);
   }
 }
 
-// =============================================================================
-// Nanopb string callback helper
-// =============================================================================
+// ============================================================================
+// Nanopb string callback helper (needed for TextMessage)
+// ============================================================================
 static bool _write_string(pb_ostream_t* stream, const pb_field_iter_t* field, void* const* arg) {
   String& str = *((String*)(*arg));
   if (!pb_encode_tag_for_field(stream, field)) return false;
@@ -110,9 +114,9 @@ static inline void write_string(pb_callback_t& target, String& str) {
   target.funcs.encode = &_write_string;
 }
 
-// =============================================================================
+// ============================================================================
 // Encode + send (timestamp is always applied here)
-// =============================================================================
+// ============================================================================
 static inline bool encode_and_send(openbikesensor_Event& event) {
   event.time_count = 1;
   event.time[0] = make_cpu_time();
@@ -132,9 +136,9 @@ static inline bool encode_and_send(openbikesensor_Event& event) {
   return true;
 }
 
-// =============================================================================
+// ============================================================================
 // OBS event helpers
-// =============================================================================
+// ============================================================================
 static inline void send_text_message(String message,
                                     openbikesensor_TextMessage_Type type = openbikesensor_TextMessage_Type_INFO) {
   openbikesensor_TextMessage msg = openbikesensor_TextMessage_init_zero;
@@ -148,11 +152,11 @@ static inline void send_text_message(String message,
   (void)encode_and_send(event);
 }
 
-static inline void send_distance_measurement(uint32_t source_id, float distance, uint64_t time_of_flight_ns) {
+static inline void send_distance_measurement(uint32_t source_id, float distance_m, uint64_t tof_ns) {
   openbikesensor_DistanceMeasurement dm = openbikesensor_DistanceMeasurement_init_zero;
   dm.source_id      = source_id;
-  dm.distance       = distance;
-  dm.time_of_flight = time_of_flight_ns;
+  dm.distance       = distance_m;
+  dm.time_of_flight = tof_ns;
 
   openbikesensor_Event event = openbikesensor_Event_init_zero;
   event.content.distance_measurement = dm;
@@ -179,59 +183,53 @@ static inline void send_heartbeat() {
   (void)encode_and_send(event);
 }
 
-// =============================================================================
+// ============================================================================
 // Wrap-safe Timer (millis overflow safe)
-// =============================================================================
+// ============================================================================
 class Timer {
 public:
   explicit Timer(uint32_t delay_ms) : delay(delay_ms) {}
-
   void start() { trigger_at = (uint32_t)millis() + delay; }
-
   bool check() {
-    if (trigger_at != 0) {
-      const uint32_t now = (uint32_t)millis();
-      if ((int32_t)(now - trigger_at) >= 0) {
-        trigger_at = 0;
-        return true;
-      }
+    if (trigger_at == 0) return false;
+    const uint32_t now = (uint32_t)millis();
+    if ((int32_t)(now - trigger_at) >= 0) {
+      trigger_at = 0;
+      return true;
     }
     return false;
   }
-
 private:
   uint32_t trigger_at = 0;
   uint32_t delay;
 };
 
-Timer heartbeat(1000);
-Timer lidarSendTimer(100); // 10 Hz
+Timer heartbeat(1000);      // 1 Hz
+Timer lidarSendTimer(100);  // 10 Hz
 
-// =============================================================================
-// TF-Luna (UART) parsing
-// =============================================================================
-static constexpr int TF_LUNA_RX_PIN = 16;
-static constexpr int TF_LUNA_TX_PIN = 17;
+// ============================================================================
+// TF-Luna UART
+// ============================================================================
 HardwareSerial TFSerial(2);
 
-volatile bool    lidar_has_value   = false;
-float            lidar_distance_m  = -1.0f;
-uint16_t         lidar_strength    = 0;
-float            lidar_temp_c      = 0.0f;
+volatile bool    lidar_has_value  = false;
+float            lidar_distance_m = -1.0f;
+uint16_t         lidar_strength   = 0;
+float            lidar_temp_c     = 0.0f;
 
-// basic quality thresholds
+// quality thresholds
 static constexpr uint16_t AMP_MIN_VALID  = 100;
 static constexpr uint16_t AMP_OVEREXPOSE = 0xFFFF;
 
-// if no frames for too long -> stale
+// mark sensor stale if no frames for too long
 static constexpr uint32_t LIDAR_STALE_MS = 600;
 
-// warning cooldown (avoid spamming)
+// rate-limit warnings
 static constexpr uint32_t WARN_COOLDOWN_MS = 30000;
 static uint32_t lastWarnMs  = 0;
 static uint32_t lastFrameMs = 0;
 
-// TF-Luna frame: 0x59 0x59 + 7 bytes + checksum = 9 bytes total
+// TF-Luna frame: 0x59 0x59 + 7 bytes + checksum = 9 bytes
 static bool readTfLunaFrame(float& distance_m, uint16_t& strength, float& temp_c) {
   static uint8_t buf[9];
   static uint8_t idx = 0;
@@ -276,17 +274,17 @@ static bool readTfLunaFrame(float& distance_m, uint16_t& strength, float& temp_c
   return false;
 }
 
-// =============================================================================
+// ============================================================================
 // Dummy right sensor (constant)
-// =============================================================================
+// ============================================================================
 static constexpr float DUMMY_RIGHT_METERS = 2.33f;
 
 // status print 1x/s
 static uint32_t lastStatusMs = 0;
 
-// =============================================================================
+// ============================================================================
 // setup()
-// =============================================================================
+// ============================================================================
 void setup() {
   Serial.begin(115200);
   delay(200);
@@ -294,21 +292,21 @@ void setup() {
   // ---- BLE init ----
   BLEDevice::init(DEV_LOCAL_NAME);
 
-  obsBleServer = BLEDevice::createServer();
-  obsBleServer->setCallbacks(new ObsBleServerCallbacks());
+  g_bleServer = BLEDevice::createServer();
+  g_bleServer->setCallbacks(new ObsBleServerCallbacks());
 
-  // Lite Service + TX notify characteristic
-  BLEService* obsService = obsBleServer->createService(OBS_BLE_SERVICE_UUID);
+  // Lite service + TX notify characteristic
+  BLEService* obsService = g_bleServer->createService(OBS_BLE_SERVICE_UUID);
 
-  obsBleTxChar = obsService->createCharacteristic(
+  g_bleTxChar = obsService->createCharacteristic(
     OBS_BLE_CHAR_TX_UUID,
     BLECharacteristic::PROPERTY_NOTIFY
   );
-  obsBleTxChar->addDescriptor(new BLE2902());
+  g_bleTxChar->addDescriptor(new BLE2902());
   obsService->start();
 
   // Device Information Service (0x180A)
-  BLEService* devInfo = obsBleServer->createService(BLEUUID((uint16_t)0x180A));
+  BLEService* devInfo = g_bleServer->createService(BLEUUID((uint16_t)0x180A));
 
   BLECharacteristic* fwRev = devInfo->createCharacteristic(
     BLEUUID((uint16_t)0x2A26), // Firmware Revision String
@@ -338,13 +336,13 @@ void setup() {
   heartbeat.start();
   lidarSendTimer.start();
 
-  // Only sent if connected
+  // Sent only if connected
   send_text_message(String("Hello: ") + DEV_LOCAL_NAME);
 }
 
-// =============================================================================
+// ============================================================================
 // loop()
-// =============================================================================
+// ============================================================================
 void loop() {
   // 1) Read a few UART frames per loop (avoid spending too much time here)
   float d_m;
@@ -368,6 +366,7 @@ void loop() {
     lidar_distance_m  = -1.0f;
     lidar_strength    = 0;
 
+    // rate-limited warning
     if ((uint32_t)(nowMs - lastWarnMs) > WARN_COOLDOWN_MS) {
       send_text_message("LiDAR: no frames (UART timeout)", openbikesensor_TextMessage_Type_WARNING);
       lastWarnMs = nowMs;
@@ -402,7 +401,7 @@ void loop() {
   if ((uint32_t)(nowMs - lastStatusMs) >= 1000) {
     lastStatusMs = nowMs;
     Serial.printf("Status: BLE=%s last_len=%lu LiDAR=%.2fm Amp=%u Temp=%.1fC\n",
-                  obsBleDeviceConnected ? "ON" : "OFF",
+                  g_bleConnected ? "ON" : "OFF",
                   (unsigned long)g_last_send_len,
                   (double)lidar_distance_m,
                   (unsigned)lidar_strength,
