@@ -15,6 +15,9 @@ Dieser Fork streamt OpenBikeSensor-Events über **Bluetooth Low Energy (BLE)** m
 - Service UUID: `6e400001-b5a3-f393-e0a9-e50e24dcca9e`
 - TX-Characteristic UUID (Notify): `6e400003-b5a3-f393-e0a9-e50e24dcca9e`
 
+## Lidar (dieser Branch)
+Dieser Branch nutzt anstelle der Ultraschall-Sensoren ein [TF-Luna](https://en.benewake.com/TFLuna/).
+
 ## Building
 
 Required: 
