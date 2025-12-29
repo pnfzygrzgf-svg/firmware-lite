@@ -34,10 +34,14 @@ static constexpr const char* OBS_BLE_SERVICE_UUID = "6e400001-b5a3-f393-e0a9-e50
 static constexpr const char* OBS_BLE_CHAR_TX_UUID = "6e400003-b5a3-f393-e0a9-e50e24dcca9e";
 
 // ------------------------- Hardware pins -------------------------------
-static constexpr int PUSHBUTTON_PIN = 2;
+// Button is wired between GPIO25 and GND -> use internal pull-up
+static constexpr int PUSHBUTTON_PIN = 25;
 
 static constexpr int TF_LUNA_RX_PIN = 16;
 static constexpr int TF_LUNA_TX_PIN = 17;
+static constexpr int LED_PIN = 2;   // blaue Onboard-LED
+
+
 
 // ------------------------- Protobuf buffer -----------------------------
 static constexpr size_t PB_BUFFER_SIZE = 1024;
@@ -288,6 +292,11 @@ static uint32_t lastStatusMs = 0;
 void setup() {
   Serial.begin(115200);
   delay(200);
+    pinMode(LED_PIN, OUTPUT);
+    digitalWrite(LED_PIN, LOW);  // erstmal aus
+
+  // ---- Button input (GPIO25 <-> GND) ----
+  pinMode(PUSHBUTTON_PIN, INPUT_PULLUP);
 
   // ---- BLE init ----
   BLEDevice::init(DEV_LOCAL_NAME);
@@ -391,11 +400,15 @@ void loop() {
     lidarSendTimer.start();
   }
 
-  // 5) Button
-  button.handle();
-  if (button.gotPressed()) {
-    send_button_press();
-  }
+    // 5) Button
+    button.handle();
+    if (button.gotPressed()) {
+      digitalWrite(LED_PIN, HIGH);
+      send_button_press();
+      delay(150);
+      digitalWrite(LED_PIN, LOW);
+    }
+
 
   // 6) Status 1x/s (Serial)
   if ((uint32_t)(nowMs - lastStatusMs) >= 1000) {
