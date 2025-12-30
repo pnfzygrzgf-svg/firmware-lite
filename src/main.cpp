@@ -17,11 +17,19 @@
 // OBS Lite LiDAR Firmware (clean, 2x TF-Luna)
 // - Sends OpenBikeSensor protobuf Events via BLE notify (Nordic UART style)
 // - Time: monotonic uptime -> reference = ARBITRARY
-// - TF-Luna LEFT  on UART2  (RX=16, TX=17)
-// - TF-Luna RIGHT on UART1  (RX=26, TX=27)
+// - TF-Luna LEFT  (SensorL1)  on UART2  (RX=27, TX=26)
+// - TF-Luna RIGHT (SensorR1)  on UART1  (RX=17, TX=16)
 // - Heartbeat: 1 Hz
 // - Distance: 10 Hz (both sensors)
 // - Button: sends UserInput event
+//
+// IMPORTANT: In HardwareSerial.begin(baud, config, rxPin, txPin):
+//   rxPin = ESP RX  (connects to SENSOR TX)
+//   txPin = ESP TX  (connects to SENSOR RX)
+//
+// PCB mapping:
+//   SensorL1 (LEFT):  SL_RX -> IO27, SL_TX -> IO26
+//   SensorR1 (RIGHT): SR_RX -> IO17, SR_TX -> IO16
 // ============================================================================
 
 // ------------------------- Device info strings -------------------------
@@ -37,15 +45,15 @@ static constexpr const char* OBS_BLE_CHAR_TX_UUID = "6e400003-b5a3-f393-e0a9-e50
 // Button is wired between GPIO25 and GND -> use internal pull-up
 static constexpr int PUSHBUTTON_PIN = 25;
 
-static constexpr int LED_PIN = 2;   // blaue Onboard-LED
+static constexpr int LED_PIN = 2;   // DevKit onboard LED (GPIO2), if present
 
-// TF-Luna LEFT
-static constexpr int TF_LEFT_RX_PIN  = 16; // Sensor TX -> ESP RX
-static constexpr int TF_LEFT_TX_PIN  = 17; // Sensor RX -> ESP TX
+// TF-Luna LEFT (SensorL1)
+static constexpr int TF_LEFT_RX_PIN  = 27; // ESP RX  <- Sensor TX (SL_RX net)
+static constexpr int TF_LEFT_TX_PIN  = 26; // ESP TX  -> Sensor RX (SL_TX net)
 
-// TF-Luna RIGHT (as you described)
-static constexpr int TF_RIGHT_RX_PIN = 26; // Sensor TX -> ESP RX (GPIO26)
-static constexpr int TF_RIGHT_TX_PIN = 27; // Sensor RX -> ESP TX (GPIO27)
+// TF-Luna RIGHT (SensorR1)
+static constexpr int TF_RIGHT_RX_PIN = 17; // ESP RX  <- Sensor TX (SR_RX net)
+static constexpr int TF_RIGHT_TX_PIN = 16; // ESP TX  -> Sensor RX (SR_TX net)
 
 // ------------------------- Protobuf buffer -----------------------------
 static constexpr size_t PB_BUFFER_SIZE = 1024;
@@ -301,6 +309,7 @@ struct TfLunaSensor {
 };
 
 enum { IDX_LEFT = 0, IDX_RIGHT = 1 };
+
 TfLunaSensor sensors[2] = {
   { "LEFT",  1, &TFLeft,  TF_LEFT_RX_PIN,  TF_LEFT_TX_PIN  },
   { "RIGHT", 2, &TFRight, TF_RIGHT_RX_PIN, TF_RIGHT_TX_PIN }
@@ -401,10 +410,10 @@ void setup() {
   // ---- TF-Luna UARTs ----
   for (auto& s : sensors) {
     s.port->begin(115200, SERIAL_8N1, s.rx_pin, s.tx_pin);
-    s.has_value = false;
-    s.distance_m = -1.0f;
-    s.strength = 0;
-    s.temp_c = 0.0f;
+    s.has_value   = false;
+    s.distance_m  = -1.0f;
+    s.strength    = 0;
+    s.temp_c      = 0.0f;
     s.lastFrameMs = (uint32_t)millis();
     s.lastWarnMs  = 0;
     s.parser.idx  = 0;
