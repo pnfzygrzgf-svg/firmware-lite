@@ -14,13 +14,13 @@
 #include "openbikesensor.pb.h"
 
 // ============================================================================
-// OBS Lite LiDAR Firmware (clean)
+// OBS Lite LiDAR Firmware (clean, 2x TF-Luna)
 // - Sends OpenBikeSensor protobuf Events via BLE notify (Nordic UART style)
-// - Time: monotonic uptime -> reference = ARBITRARY (no fake UNIX time)
-// - TF-Luna on UART provides LEFT distance
-// - RIGHT distance is a constant dummy value
+// - Time: monotonic uptime -> reference = ARBITRARY
+// - TF-Luna LEFT  on UART2  (RX=16, TX=17)
+// - TF-Luna RIGHT on UART1  (RX=26, TX=27)
 // - Heartbeat: 1 Hz
-// - Distance: 10 Hz
+// - Distance: 10 Hz (both sensors)
 // - Button: sends UserInput event
 // ============================================================================
 
@@ -37,11 +37,15 @@ static constexpr const char* OBS_BLE_CHAR_TX_UUID = "6e400003-b5a3-f393-e0a9-e50
 // Button is wired between GPIO25 and GND -> use internal pull-up
 static constexpr int PUSHBUTTON_PIN = 25;
 
-static constexpr int TF_LUNA_RX_PIN = 16;
-static constexpr int TF_LUNA_TX_PIN = 17;
 static constexpr int LED_PIN = 2;   // blaue Onboard-LED
 
+// TF-Luna LEFT
+static constexpr int TF_LEFT_RX_PIN  = 16; // Sensor TX -> ESP RX
+static constexpr int TF_LEFT_TX_PIN  = 17; // Sensor RX -> ESP TX
 
+// TF-Luna RIGHT (as you described)
+static constexpr int TF_RIGHT_RX_PIN = 26; // Sensor TX -> ESP RX (GPIO26)
+static constexpr int TF_RIGHT_TX_PIN = 27; // Sensor RX -> ESP TX (GPIO27)
 
 // ------------------------- Protobuf buffer -----------------------------
 static constexpr size_t PB_BUFFER_SIZE = 1024;
@@ -212,58 +216,51 @@ Timer heartbeat(1000);      // 1 Hz
 Timer lidarSendTimer(100);  // 10 Hz
 
 // ============================================================================
-// TF-Luna UART
+// TF-Luna parsing (state per sensor!)
 // ============================================================================
-HardwareSerial TFSerial(2);
-
-volatile bool    lidar_has_value  = false;
-float            lidar_distance_m = -1.0f;
-uint16_t         lidar_strength   = 0;
-float            lidar_temp_c     = 0.0f;
-
-// quality thresholds
 static constexpr uint16_t AMP_MIN_VALID  = 100;
 static constexpr uint16_t AMP_OVEREXPOSE = 0xFFFF;
 
 // mark sensor stale if no frames for too long
 static constexpr uint32_t LIDAR_STALE_MS = 600;
 
-// rate-limit warnings
+// rate-limit warnings (per sensor)
 static constexpr uint32_t WARN_COOLDOWN_MS = 30000;
-static uint32_t lastWarnMs  = 0;
-static uint32_t lastFrameMs = 0;
 
 // TF-Luna frame: 0x59 0x59 + 7 bytes + checksum = 9 bytes
-static bool readTfLunaFrame(float& distance_m, uint16_t& strength, float& temp_c) {
-  static uint8_t buf[9];
-  static uint8_t idx = 0;
+struct TfLunaParser {
+  uint8_t buf[9];
+  uint8_t idx = 0;
+};
 
-  while (TFSerial.available()) {
-    const uint8_t b = (uint8_t)TFSerial.read();
+static bool readTfLunaFrame(HardwareSerial& port, TfLunaParser& p,
+                            float& distance_m, uint16_t& strength, float& temp_c) {
+  while (port.available()) {
+    const uint8_t b = (uint8_t)port.read();
 
-    if (idx == 0) {
+    if (p.idx == 0) {
       if (b != 0x59) continue;
-      buf[idx++] = b;
+      p.buf[p.idx++] = b;
       continue;
     }
-    if (idx == 1) {
-      if (b != 0x59) { idx = 0; continue; }
-      buf[idx++] = b;
+    if (p.idx == 1) {
+      if (b != 0x59) { p.idx = 0; continue; }
+      p.buf[p.idx++] = b;
       continue;
     }
 
-    buf[idx++] = b;
+    p.buf[p.idx++] = b;
 
-    if (idx == 9) {
-      idx = 0;
+    if (p.idx == 9) {
+      p.idx = 0;
 
       uint16_t sum = 0;
-      for (int i = 0; i < 8; i++) sum += buf[i];
-      if (((uint8_t)sum) != buf[8]) return false;
+      for (int i = 0; i < 8; i++) sum += p.buf[i];
+      if (((uint8_t)sum) != p.buf[8]) return false;
 
-      const uint16_t dist_cm = (uint16_t)buf[2] | ((uint16_t)buf[3] << 8);
-      strength               = (uint16_t)buf[4] | ((uint16_t)buf[5] << 8);
-      const uint16_t tempRaw = (uint16_t)buf[6] | ((uint16_t)buf[7] << 8);
+      const uint16_t dist_cm = (uint16_t)p.buf[2] | ((uint16_t)p.buf[3] << 8);
+      strength               = (uint16_t)p.buf[4] | ((uint16_t)p.buf[5] << 8);
+      const uint16_t tempRaw = (uint16_t)p.buf[6] | ((uint16_t)p.buf[7] << 8);
       temp_c = ((float)tempRaw) / 8.0f - 256.0f;
 
       if (strength < AMP_MIN_VALID || strength == AMP_OVEREXPOSE ||
@@ -279,9 +276,70 @@ static bool readTfLunaFrame(float& distance_m, uint16_t& strength, float& temp_c
 }
 
 // ============================================================================
-// Dummy right sensor (constant)
+// Two-sensor wrapper (array/struct)
 // ============================================================================
-static constexpr float DUMMY_RIGHT_METERS = 2.33f;
+HardwareSerial TFLeft(2);   // UART2
+HardwareSerial TFRight(1);  // UART1
+
+struct TfLunaSensor {
+  const char*      name;
+  uint32_t         source_id;   // OBS DistanceMeasurement.source_id (1=left, 2=right)
+
+  HardwareSerial*  port;
+  int              rx_pin;
+  int              tx_pin;
+
+  TfLunaParser     parser;
+
+  bool             has_value = false;
+  float            distance_m = -1.0f;
+  uint16_t         strength = 0;
+  float            temp_c = 0.0f;
+
+  uint32_t         lastFrameMs = 0;
+  uint32_t         lastWarnMs  = 0;
+};
+
+enum { IDX_LEFT = 0, IDX_RIGHT = 1 };
+TfLunaSensor sensors[2] = {
+  { "LEFT",  1, &TFLeft,  TF_LEFT_RX_PIN,  TF_LEFT_TX_PIN  },
+  { "RIGHT", 2, &TFRight, TF_RIGHT_RX_PIN, TF_RIGHT_TX_PIN }
+};
+
+static inline void poll_sensor(TfLunaSensor& s, uint32_t nowMs) {
+  // Read a few frames per loop to keep loop responsive
+  float d_m;
+  uint16_t amp;
+  float t_c;
+
+  int frames = 0;
+  while (frames < 3 && readTfLunaFrame(*s.port, s.parser, d_m, amp, t_c)) {
+    frames++;
+    s.distance_m = d_m;
+    s.strength   = amp;
+    s.temp_c     = t_c;
+    s.has_value  = true;
+    s.lastFrameMs = nowMs;
+  }
+
+  // stale detection
+  if (s.has_value && (uint32_t)(nowMs - s.lastFrameMs) > LIDAR_STALE_MS) {
+    s.has_value  = false;
+    s.distance_m = -1.0f;
+    s.strength   = 0;
+
+    if ((uint32_t)(nowMs - s.lastWarnMs) > WARN_COOLDOWN_MS) {
+      send_text_message(String("LiDAR ") + s.name + ": no frames (UART timeout)",
+                        openbikesensor_TextMessage_Type_WARNING);
+      s.lastWarnMs = nowMs;
+    }
+  }
+}
+
+static inline float export_distance_or_sentinel(const TfLunaSensor& s) {
+  // importer-safe: invalid -> sentinel large value
+  return (s.has_value && s.distance_m > 0.0f) ? s.distance_m : 99.0f;
+}
 
 // status print 1x/s
 static uint32_t lastStatusMs = 0;
@@ -292,8 +350,9 @@ static uint32_t lastStatusMs = 0;
 void setup() {
   Serial.begin(115200);
   delay(200);
-    pinMode(LED_PIN, OUTPUT);
-    digitalWrite(LED_PIN, LOW);  // erstmal aus
+
+  pinMode(LED_PIN, OUTPUT);
+  digitalWrite(LED_PIN, LOW);  // erstmal aus
 
   // ---- Button input (GPIO25 <-> GND) ----
   pinMode(PUSHBUTTON_PIN, INPUT_PULLUP);
@@ -339,13 +398,22 @@ void setup() {
   advertising->setMaxPreferred(0x12);
   BLEDevice::startAdvertising();
 
-  // ---- TF-Luna UART ----
-  TFSerial.begin(115200, SERIAL_8N1, TF_LUNA_RX_PIN, TF_LUNA_TX_PIN);
+  // ---- TF-Luna UARTs ----
+  for (auto& s : sensors) {
+    s.port->begin(115200, SERIAL_8N1, s.rx_pin, s.tx_pin);
+    s.has_value = false;
+    s.distance_m = -1.0f;
+    s.strength = 0;
+    s.temp_c = 0.0f;
+    s.lastFrameMs = (uint32_t)millis();
+    s.lastWarnMs  = 0;
+    s.parser.idx  = 0;
+  }
 
   heartbeat.start();
   lidarSendTimer.start();
 
-  // Sent only if connected
+  // Sent only if connected (harmless if not connected yet)
   send_text_message(String("Hello: ") + DEV_LOCAL_NAME);
 }
 
@@ -353,71 +421,50 @@ void setup() {
 // loop()
 // ============================================================================
 void loop() {
-  // 1) Read a few UART frames per loop (avoid spending too much time here)
-  float d_m;
-  uint16_t s;
-  float t_c;
-
-  int frames = 0;
-  while (frames < 3 && readTfLunaFrame(d_m, s, t_c)) {
-    frames++;
-    lidar_distance_m = d_m;
-    lidar_strength   = s;
-    lidar_temp_c     = t_c;
-    lidar_has_value  = true;
-    lastFrameMs      = (uint32_t)millis();
-  }
-
-  // 2) stale detection (no frames for a while)
   const uint32_t nowMs = (uint32_t)millis();
-  if (lidar_has_value && (uint32_t)(nowMs - lastFrameMs) > LIDAR_STALE_MS) {
-    lidar_has_value   = false;
-    lidar_distance_m  = -1.0f;
-    lidar_strength    = 0;
 
-    // rate-limited warning
-    if ((uint32_t)(nowMs - lastWarnMs) > WARN_COOLDOWN_MS) {
-      send_text_message("LiDAR: no frames (UART timeout)", openbikesensor_TextMessage_Type_WARNING);
-      lastWarnMs = nowMs;
-    }
+  // 1) Poll both sensors
+  for (auto& s : sensors) {
+    poll_sensor(s, nowMs);
   }
 
-  // 3) Heartbeat
+  // 2) Heartbeat
   if (heartbeat.check()) {
     send_heartbeat();
     heartbeat.start();
   }
 
-  // 4) Send LiDAR at fixed rate + dummy right constant
+  // 3) Send distances at fixed rate
   if (lidarSendTimer.check()) {
-    // importer-safe: always send; invalid -> sentinel large value
-    const float leftMeters =
-      (lidar_has_value && lidar_distance_m > 0.0f) ? lidar_distance_m : 99.0f;
-
-    send_distance_measurement(1, leftMeters, 0);
-    send_distance_measurement(2, DUMMY_RIGHT_METERS, 0);
-
+    for (const auto& s : sensors) {
+      const float meters = export_distance_or_sentinel(s);
+      send_distance_measurement(s.source_id, meters, 0);
+    }
     lidarSendTimer.start();
   }
 
-    // 5) Button
-    button.handle();
-    if (button.gotPressed()) {
-      digitalWrite(LED_PIN, HIGH);
-      send_button_press();
-      delay(150);
-      digitalWrite(LED_PIN, LOW);
-    }
+  // 4) Button
+  button.handle();
+  if (button.gotPressed()) {
+    digitalWrite(LED_PIN, HIGH);
+    send_button_press();
+    delay(150);
+    digitalWrite(LED_PIN, LOW);
+  }
 
-
-  // 6) Status 1x/s (Serial)
+  // 5) Status 1x/s (Serial)
   if ((uint32_t)(nowMs - lastStatusMs) >= 1000) {
     lastStatusMs = nowMs;
-    Serial.printf("Status: BLE=%s last_len=%lu LiDAR=%.2fm Amp=%u Temp=%.1fC\n",
+
+    Serial.printf("Status: BLE=%s last_len=%lu "
+                  "L=%.2fm Amp=%u Temp=%.1fC | R=%.2fm Amp=%u Temp=%.1fC\n",
                   g_bleConnected ? "ON" : "OFF",
                   (unsigned long)g_last_send_len,
-                  (double)lidar_distance_m,
-                  (unsigned)lidar_strength,
-                  (double)lidar_temp_c);
+                  (double)sensors[IDX_LEFT].distance_m,
+                  (unsigned)sensors[IDX_LEFT].strength,
+                  (double)sensors[IDX_LEFT].temp_c,
+                  (double)sensors[IDX_RIGHT].distance_m,
+                  (unsigned)sensors[IDX_RIGHT].strength,
+                  (double)sensors[IDX_RIGHT].temp_c);
   }
 }
