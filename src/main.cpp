@@ -22,14 +22,6 @@
 // - Heartbeat: 1 Hz
 // - Distance: 10 Hz (both sensors)
 // - Button: sends UserInput event
-//
-// IMPORTANT: In HardwareSerial.begin(baud, config, rxPin, txPin):
-//   rxPin = ESP RX  (connects to SENSOR TX)
-//   txPin = ESP TX  (connects to SENSOR RX)
-//
-// PCB mapping:
-//   SensorL1 (LEFT):  SL_RX -> IO27, SL_TX -> IO26
-//   SensorR1 (RIGHT): SR_RX -> IO17, SR_TX -> IO16
 // ============================================================================
 
 // ------------------------- Device info strings -------------------------
@@ -42,18 +34,16 @@ static constexpr const char* OBS_BLE_SERVICE_UUID = "6e400001-b5a3-f393-e0a9-e50
 static constexpr const char* OBS_BLE_CHAR_TX_UUID = "6e400003-b5a3-f393-e0a9-e50e24dcca9e";
 
 // ------------------------- Hardware pins -------------------------------
-// Button is wired between GPIO25 and GND -> use internal pull-up
-static constexpr int PUSHBUTTON_PIN = 25;
-
-static constexpr int LED_PIN = 2;   // DevKit onboard LED (GPIO2), if present
+static constexpr int PUSHBUTTON_PIN = 25; // Button between GPIO25 and GND
+static constexpr int LED_PIN = 2;         // DevKit onboard LED (GPIO2)
 
 // TF-Luna LEFT (SensorL1)
-static constexpr int TF_LEFT_RX_PIN  = 27; // ESP RX  <- Sensor TX (SL_RX net)
-static constexpr int TF_LEFT_TX_PIN  = 26; // ESP TX  -> Sensor RX (SL_TX net)
+static constexpr int TF_LEFT_RX_PIN  = 27; // ESP RX  <- Sensor TX
+static constexpr int TF_LEFT_TX_PIN  = 26; // ESP TX  -> Sensor RX
 
 // TF-Luna RIGHT (SensorR1)
-static constexpr int TF_RIGHT_RX_PIN = 17; // ESP RX  <- Sensor TX (SR_RX net)
-static constexpr int TF_RIGHT_TX_PIN = 16; // ESP TX  -> Sensor RX (SR_TX net)
+static constexpr int TF_RIGHT_RX_PIN = 17; // ESP RX  <- Sensor TX
+static constexpr int TF_RIGHT_TX_PIN = 16; // ESP TX  -> Sensor RX
 
 // ------------------------- Protobuf buffer -----------------------------
 static constexpr size_t PB_BUFFER_SIZE = 1024;
@@ -67,7 +57,7 @@ static inline openbikesensor_Time make_obs_time(int32_t time_source_id = 1) {
   const uint64_t us = (uint64_t)esp_timer_get_time();
 
   openbikesensor_Time t = openbikesensor_Time_init_zero;
-  t.source_id   = time_source_id; // convention: 1 = internal CPU clock
+  t.source_id   = time_source_id;
   t.reference   = openbikesensor_Time_Reference_ARBITRARY;
   t.seconds     = (int64_t)(us / 1000000ULL);
   t.nanoseconds = (int32_t)((us % 1000000ULL) * 1000ULL);
@@ -102,8 +92,6 @@ Button button(PUSHBUTTON_PIN);
 
 // ============================================================================
 // BLE send helper
-// - Sends one protobuf Event as a single BLE notify.
-// - delay(1) gives BLE stack a tiny bit of time under frequent notifications.
 // ============================================================================
 static uint32_t g_last_send_len = 0;
 
@@ -113,7 +101,7 @@ static inline void send_event_bytes(const uint8_t* data, size_t len) {
   if (g_bleConnected && g_bleTxChar != nullptr) {
     g_bleTxChar->setValue((uint8_t*)data, len);
     g_bleTxChar->notify();
-    delay(1);
+    delay(1); // tiny yield for BLE stack
   }
 }
 
@@ -223,26 +211,32 @@ private:
 Timer heartbeat(1000);      // 1 Hz
 Timer lidarSendTimer(100);  // 10 Hz
 
+// Non-blocking LED off
+Timer ledOffTimer(150);
+static bool ledIsOn = false;
+
 // ============================================================================
 // TF-Luna parsing (state per sensor!)
 // ============================================================================
 static constexpr uint16_t AMP_MIN_VALID  = 100;
 static constexpr uint16_t AMP_OVEREXPOSE = 0xFFFF;
 
-// mark sensor stale if no frames for too long
 static constexpr uint32_t LIDAR_STALE_MS = 600;
-
-// rate-limit warnings (per sensor)
 static constexpr uint32_t WARN_COOLDOWN_MS = 30000;
 
-// TF-Luna frame: 0x59 0x59 + 7 bytes + checksum = 9 bytes
 struct TfLunaParser {
   uint8_t buf[9];
   uint8_t idx = 0;
 };
 
-static bool readTfLunaFrame(HardwareSerial& port, TfLunaParser& p,
-                            float& distance_m, uint16_t& strength, float& temp_c) {
+enum TfLunaResult : uint8_t {
+  TF_NO_DATA      = 0,
+  TF_VALID_FRAME  = 1,
+  TF_BAD_CHECKSUM = 2
+};
+
+static TfLunaResult readTfLunaFrame(HardwareSerial& port, TfLunaParser& p,
+                                   float& distance_m, uint16_t& strength, float& temp_c) {
   while (port.available()) {
     const uint8_t b = (uint8_t)port.read();
 
@@ -260,11 +254,13 @@ static bool readTfLunaFrame(HardwareSerial& port, TfLunaParser& p,
     p.buf[p.idx++] = b;
 
     if (p.idx == 9) {
-      p.idx = 0;
+      p.idx = 0; // reset ALWAYS
 
       uint16_t sum = 0;
       for (int i = 0; i < 8; i++) sum += p.buf[i];
-      if (((uint8_t)sum) != p.buf[8]) return false;
+      if (((uint8_t)sum) != p.buf[8]) {
+        return TF_BAD_CHECKSUM;
+      }
 
       const uint16_t dist_cm = (uint16_t)p.buf[2] | ((uint16_t)p.buf[3] << 8);
       strength               = (uint16_t)p.buf[4] | ((uint16_t)p.buf[5] << 8);
@@ -277,21 +273,21 @@ static bool readTfLunaFrame(HardwareSerial& port, TfLunaParser& p,
       } else {
         distance_m = (float)dist_cm / 100.0f;
       }
-      return true;
+      return TF_VALID_FRAME;
     }
   }
-  return false;
+  return TF_NO_DATA;
 }
 
 // ============================================================================
-// Two-sensor wrapper (array/struct)
+// Two-sensor wrapper
 // ============================================================================
 HardwareSerial TFLeft(2);   // UART2
 HardwareSerial TFRight(1);  // UART1
 
 struct TfLunaSensor {
   const char*      name;
-  uint32_t         source_id;   // OBS DistanceMeasurement.source_id (1=left, 2=right)
+  uint32_t         source_id;
 
   HardwareSerial*  port;
   int              rx_pin;
@@ -316,22 +312,41 @@ TfLunaSensor sensors[2] = {
 };
 
 static inline void poll_sensor(TfLunaSensor& s, uint32_t nowMs) {
-  // Read a few frames per loop to keep loop responsive
   float d_m;
   uint16_t amp;
   float t_c;
 
-  int frames = 0;
-  while (frames < 3 && readTfLunaFrame(*s.port, s.parser, d_m, amp, t_c)) {
-    frames++;
-    s.distance_m = d_m;
-    s.strength   = amp;
-    s.temp_c     = t_c;
-    s.has_value  = true;
+  int validFrames = 0;
+  int badChecksums = 0;
+
+  int completedFrames = 0;
+  static constexpr int MAX_COMPLETED_FRAMES_PER_POLL = 10;
+
+  while (validFrames < 3 && completedFrames < MAX_COMPLETED_FRAMES_PER_POLL) {
+    TfLunaResult r = readTfLunaFrame(*s.port, s.parser, d_m, amp, t_c);
+    if (r == TF_NO_DATA) break;
+
+    completedFrames++;
+
+    if (r == TF_BAD_CHECKSUM) {
+      badChecksums++;
+      continue;
+    }
+
+    validFrames++;
+    s.distance_m  = d_m;
+    s.strength    = amp;
+    s.temp_c      = t_c;
+    s.has_value   = true;
     s.lastFrameMs = nowMs;
   }
 
-  // stale detection
+  if (badChecksums >= 3 && (uint32_t)(nowMs - s.lastWarnMs) > WARN_COOLDOWN_MS) {
+    send_text_message(String("LiDAR ") + s.name + ": " + String(badChecksums) + " checksum errors",
+                      openbikesensor_TextMessage_Type_WARNING);
+    s.lastWarnMs = nowMs;
+  }
+
   if (s.has_value && (uint32_t)(nowMs - s.lastFrameMs) > LIDAR_STALE_MS) {
     s.has_value  = false;
     s.distance_m = -1.0f;
@@ -346,11 +361,9 @@ static inline void poll_sensor(TfLunaSensor& s, uint32_t nowMs) {
 }
 
 static inline float export_distance_or_sentinel(const TfLunaSensor& s) {
-  // importer-safe: invalid -> sentinel large value
   return (s.has_value && s.distance_m > 0.0f) ? s.distance_m : 99.0f;
 }
 
-// status print 1x/s
 static uint32_t lastStatusMs = 0;
 
 // ============================================================================
@@ -361,9 +374,7 @@ void setup() {
   delay(200);
 
   pinMode(LED_PIN, OUTPUT);
-  digitalWrite(LED_PIN, LOW);  // erstmal aus
-
-  // ---- Button input (GPIO25 <-> GND) ----
+  digitalWrite(LED_PIN, LOW);
   pinMode(PUSHBUTTON_PIN, INPUT_PULLUP);
 
   // ---- BLE init ----
@@ -372,7 +383,6 @@ void setup() {
   g_bleServer = BLEDevice::createServer();
   g_bleServer->setCallbacks(new ObsBleServerCallbacks());
 
-  // Lite service + TX notify characteristic
   BLEService* obsService = g_bleServer->createService(OBS_BLE_SERVICE_UUID);
 
   g_bleTxChar = obsService->createCharacteristic(
@@ -386,20 +396,19 @@ void setup() {
   BLEService* devInfo = g_bleServer->createService(BLEUUID((uint16_t)0x180A));
 
   BLECharacteristic* fwRev = devInfo->createCharacteristic(
-    BLEUUID((uint16_t)0x2A26), // Firmware Revision String
+    BLEUUID((uint16_t)0x2A26),
     BLECharacteristic::PROPERTY_READ
   );
   fwRev->setValue(DEV_FW_REV);
 
   BLECharacteristic* manu = devInfo->createCharacteristic(
-    BLEUUID((uint16_t)0x2A29), // Manufacturer Name String
+    BLEUUID((uint16_t)0x2A29),
     BLECharacteristic::PROPERTY_READ
   );
   manu->setValue(DEV_MANUFACTURER);
 
   devInfo->start();
 
-  // Advertising: include service UUID + scan response with name
   BLEAdvertising* advertising = BLEDevice::getAdvertising();
   advertising->addServiceUUID(OBS_BLE_SERVICE_UUID);
   advertising->setScanResponse(true);
@@ -409,7 +418,11 @@ void setup() {
 
   // ---- TF-Luna UARTs ----
   for (auto& s : sensors) {
+    // IMPORTANT: enlarge RX buffer BEFORE begin()
+    s.port->setRxBufferSize(1024);
+
     s.port->begin(115200, SERIAL_8N1, s.rx_pin, s.tx_pin);
+
     s.has_value   = false;
     s.distance_m  = -1.0f;
     s.strength    = 0;
@@ -422,7 +435,6 @@ void setup() {
   heartbeat.start();
   lidarSendTimer.start();
 
-  // Sent only if connected (harmless if not connected yet)
   send_text_message(String("Hello: ") + DEV_LOCAL_NAME);
 }
 
@@ -452,13 +464,18 @@ void loop() {
     lidarSendTimer.start();
   }
 
-  // 4) Button
+  // 4) Button (non-blocking LED)
   button.handle();
   if (button.gotPressed()) {
     digitalWrite(LED_PIN, HIGH);
+    ledIsOn = true;
+    ledOffTimer.start();
+
     send_button_press();
-    delay(150);
+  }
+  if (ledIsOn && ledOffTimer.check()) {
     digitalWrite(LED_PIN, LOW);
+    ledIsOn = false;
   }
 
   // 5) Status 1x/s (Serial)
