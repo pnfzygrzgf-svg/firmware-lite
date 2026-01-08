@@ -9,16 +9,16 @@
 #include <BLE2902.h>
 
 #include <HardwareSerial.h>
-#include <esp_timer.h>   // esp_timer_get_time(): 64-bit uptime (µs since boot)
+#include <esp_timer.h>
 
 #include "openbikesensor.pb.h"
 
 // ============================================================================
-// OBS Lite LiDAR Firmware (clean, 2x TF-Luna)
+// OBS Lite LiDAR Firmware (2x TF-Luna)
 // - Sends OpenBikeSensor protobuf Events via BLE notify (Nordic UART style)
 // - Time: monotonic uptime -> reference = ARBITRARY
-// - TF-Luna LEFT  (SensorL1)  on UART2  (RX=27, TX=26)
-// - TF-Luna RIGHT (SensorR1)  on UART1  (RX=17, TX=16)
+// - SensorL1 (LEFT):  TX->GPIO26, RX->GPIO27  => ESP RX=26, TX=27
+// - SensorR1 (RIGHT): TX->GPIO16, RX->GPIO17  => ESP RX=16, TX=17
 // - Heartbeat: 1 Hz
 // - Distance: 10 Hz (both sensors)
 // - Button: sends UserInput event
@@ -37,13 +37,13 @@ static constexpr const char* OBS_BLE_CHAR_TX_UUID = "6e400003-b5a3-f393-e0a9-e50
 static constexpr int PUSHBUTTON_PIN = 25; // Button between GPIO25 and GND
 static constexpr int LED_PIN = 2;         // DevKit onboard LED (GPIO2)
 
-// TF-Luna LEFT (SensorL1)
-static constexpr int TF_LEFT_RX_PIN  = 27; // ESP RX  <- Sensor TX
-static constexpr int TF_LEFT_TX_PIN  = 26; // ESP TX  -> Sensor RX
+// LEFT (SensorL1): Sensor TX->26, Sensor RX->27 => ESP RX=26, TX=27
+static constexpr int TF_LEFT_RX_PIN  = 26; // ESP RX  <- Sensor TX
+static constexpr int TF_LEFT_TX_PIN  = 27; // ESP TX  -> Sensor RX
 
-// TF-Luna RIGHT (SensorR1)
-static constexpr int TF_RIGHT_RX_PIN = 17; // ESP RX  <- Sensor TX
-static constexpr int TF_RIGHT_TX_PIN = 16; // ESP TX  -> Sensor RX
+// RIGHT (SensorR1): Sensor TX->16, Sensor RX->17 => ESP RX=16, TX=17
+static constexpr int TF_RIGHT_RX_PIN = 16; // ESP RX  <- Sensor TX
+static constexpr int TF_RIGHT_TX_PIN = 17; // ESP TX  -> Sensor RX
 
 // ------------------------- Protobuf buffer -----------------------------
 static constexpr size_t PB_BUFFER_SIZE = 1024;
@@ -210,10 +210,7 @@ private:
 
 Timer heartbeat(1000);      // 1 Hz
 Timer lidarSendTimer(100);  // 10 Hz
-
-// Non-blocking LED off
 Timer ledOffTimer(150);
-static bool ledIsOn = false;
 
 // ============================================================================
 // TF-Luna parsing (state per sensor!)
@@ -254,7 +251,7 @@ static TfLunaResult readTfLunaFrame(HardwareSerial& port, TfLunaParser& p,
     p.buf[p.idx++] = b;
 
     if (p.idx == 9) {
-      p.idx = 0; // reset ALWAYS
+      p.idx = 0;
 
       uint16_t sum = 0;
       for (int i = 0; i < 8; i++) sum += p.buf[i];
@@ -302,13 +299,18 @@ struct TfLunaSensor {
 
   uint32_t         lastFrameMs = 0;
   uint32_t         lastWarnMs  = 0;
+
+  TfLunaSensor(const char* n, uint32_t sid, HardwareSerial* p, int rx, int tx)
+  : name(n), source_id(sid), port(p), rx_pin(rx), tx_pin(tx) {
+    parser.idx = 0;
+  }
 };
 
 enum { IDX_LEFT = 0, IDX_RIGHT = 1 };
 
 TfLunaSensor sensors[2] = {
-  { "LEFT",  1, &TFLeft,  TF_LEFT_RX_PIN,  TF_LEFT_TX_PIN  },
-  { "RIGHT", 2, &TFRight, TF_RIGHT_RX_PIN, TF_RIGHT_TX_PIN }
+  TfLunaSensor("LEFT",  1, &TFLeft,  TF_LEFT_RX_PIN,  TF_LEFT_TX_PIN),
+  TfLunaSensor("RIGHT", 2, &TFRight, TF_RIGHT_RX_PIN, TF_RIGHT_TX_PIN)
 };
 
 static inline void poll_sensor(TfLunaSensor& s, uint32_t nowMs) {
@@ -364,6 +366,7 @@ static inline float export_distance_or_sentinel(const TfLunaSensor& s) {
   return (s.has_value && s.distance_m > 0.0f) ? s.distance_m : 99.0f;
 }
 
+static bool ledIsOn = false;
 static uint32_t lastStatusMs = 0;
 
 // ============================================================================
@@ -418,9 +421,6 @@ void setup() {
 
   // ---- TF-Luna UARTs ----
   for (auto& s : sensors) {
-    // IMPORTANT: enlarge RX buffer BEFORE begin()
-    s.port->setRxBufferSize(1024);
-
     s.port->begin(115200, SERIAL_8N1, s.rx_pin, s.tx_pin);
 
     s.has_value   = false;
@@ -430,6 +430,8 @@ void setup() {
     s.lastFrameMs = (uint32_t)millis();
     s.lastWarnMs  = 0;
     s.parser.idx  = 0;
+
+    Serial.printf("UART init %s: RX=%d TX=%d\n", s.name, s.rx_pin, s.tx_pin);
   }
 
   heartbeat.start();
@@ -470,7 +472,6 @@ void loop() {
     digitalWrite(LED_PIN, HIGH);
     ledIsOn = true;
     ledOffTimer.start();
-
     send_button_press();
   }
   if (ledIsOn && ledOffTimer.check()) {
