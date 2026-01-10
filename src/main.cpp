@@ -11,18 +11,27 @@
 #include <HardwareSerial.h>
 #include <esp_timer.h>
 
+#include <PacketSerial.h>
+
 #include "openbikesensor.pb.h"
 
 // ============================================================================
 // OBS Lite LiDAR Firmware (2x TF-Luna)
-// - Sends OpenBikeSensor protobuf Events via BLE notify (Nordic UART style)
-// - Time: monotonic uptime -> reference = ARBITRARY
-// - SensorL1 (LEFT):  TX->GPIO26, RX->GPIO27  => ESP RX=26, TX=27
-// - SensorR1 (RIGHT): TX->GPIO16, RX->GPIO17  => ESP RX=16, TX=17
-// - Heartbeat: 1 Hz
-// - Distance: 10 Hz (both sensors)
-// - Button: sends UserInput event
+// - Sends OpenBikeSensor protobuf Events via:
+//     (A) BLE notify (Nordic UART style)  <-- unchanged for iOS app
+//     (B) USB cable (PacketSerial / SLIP framing) for Android USB-Serial
+//
+// IMPORTANT (USB "connected" detection):
+// - On ESP32-WROOM DevKit (USB-to-UART) we cannot reliably detect "port opened"
+//   without DTR/RTS support OR a handshake from the host.
+// - Therefore default is: USB ALWAYS SENDS (works with read-only Android apps).
+// - If you can make Android send 1 byte on connect, set USB_REQUIRE_KNOCK = 1.
 // ============================================================================
+
+// ------------------------- USB behavior switch -------------------------
+// 0 = USB always sends (recommended / works with read-only Android apps)
+// 1 = USB sends only after any incoming byte/packet from host ("knock")
+#define USB_REQUIRE_KNOCK 0
 
 // ------------------------- Device info strings -------------------------
 static constexpr const char* DEV_LOCAL_NAME   = "OBS Lite LiDAR";
@@ -50,6 +59,16 @@ static constexpr size_t PB_BUFFER_SIZE = 1024;
 static uint8_t      pb_buffer[PB_BUFFER_SIZE];
 static pb_ostream_t pb_ostream;
 
+// ------------------------- USB cable output (PacketSerial) -------------
+PacketSerial packetSerial; // uses Serial internally (USB-UART)
+
+static bool g_usbHostConnected = false;
+
+static void onSerialPacket(const uint8_t* /*buffer*/, size_t /*size*/) {
+  // Any received packet marks host as connected (only used when USB_REQUIRE_KNOCK=1)
+  g_usbHostConnected = true;
+}
+
 // ============================================================================
 // Time (Uptime only) correct semantic: ARBITRARY
 // ============================================================================
@@ -76,11 +95,11 @@ class ObsBleServerCallbacks : public BLEServerCallbacks {
   void onConnect(BLEServer* s) override {
     (void)s;
     g_bleConnected = true;
-    Serial.println("BLE: connected");
+    // no Serial prints (PacketSerial stream!)
   }
   void onDisconnect(BLEServer* s) override {
     g_bleConnected = false;
-    Serial.println("BLE: disconnected -> advertising");
+    // no Serial prints (PacketSerial stream!)
     s->startAdvertising();
   }
 };
@@ -91,17 +110,27 @@ class ObsBleServerCallbacks : public BLEServerCallbacks {
 Button button(PUSHBUTTON_PIN);
 
 // ============================================================================
-// BLE send helper
+// Dual transport send helper (BLE + USB cable)
 // ============================================================================
 static uint32_t g_last_send_len = 0;
 
 static inline void send_event_bytes(const uint8_t* data, size_t len) {
   g_last_send_len = (uint32_t)len;
 
+  // USB
+#if USB_REQUIRE_KNOCK
+  if (g_usbHostConnected) {
+    packetSerial.send(data, len);
+  }
+#else
+  packetSerial.send(data, len);
+#endif
+
+  // BLE (UNCHANGED)
   if (g_bleConnected && g_bleTxChar != nullptr) {
     g_bleTxChar->setValue((uint8_t*)data, len);
     g_bleTxChar->notify();
-    delay(1); // tiny yield for BLE stack
+    delay(1);
   }
 }
 
@@ -127,14 +156,8 @@ static inline bool encode_and_send(openbikesensor_Event& event) {
 
   pb_ostream = pb_ostream_from_buffer(pb_buffer, sizeof(pb_buffer));
   const bool ok = pb_encode(&pb_ostream, &openbikesensor_Event_msg, &event);
-  if (!ok) {
-    Serial.printf("PB ENCODE FAILED: %s\n", PB_GET_ERROR(&pb_ostream));
-    return false;
-  }
-  if (pb_ostream.bytes_written == 0) {
-    Serial.println("PB ENCODE WARNING: bytes_written == 0 (not sending)");
-    return false;
-  }
+  if (!ok) return false;
+  if (pb_ostream.bytes_written == 0) return false;
 
   send_event_bytes(pb_buffer, pb_ostream.bytes_written);
   return true;
@@ -367,20 +390,26 @@ static inline float export_distance_or_sentinel(const TfLunaSensor& s) {
 }
 
 static bool ledIsOn = false;
-static uint32_t lastStatusMs = 0;
 
 // ============================================================================
 // setup()
 // ============================================================================
 void setup() {
-  Serial.begin(115200);
+  packetSerial.setPacketHandler(&onSerialPacket);
+  packetSerial.begin(115200);
   delay(200);
+
+#if USB_REQUIRE_KNOCK
+  g_usbHostConnected = false;
+#else
+  g_usbHostConnected = true;   // ensures Android read-only apps work
+#endif
 
   pinMode(LED_PIN, OUTPUT);
   digitalWrite(LED_PIN, LOW);
   pinMode(PUSHBUTTON_PIN, INPUT_PULLUP);
 
-  // ---- BLE init ----
+  // ---- BLE init ---- (UNCHANGED)
   BLEDevice::init(DEV_LOCAL_NAME);
 
   g_bleServer = BLEDevice::createServer();
@@ -430,8 +459,6 @@ void setup() {
     s.lastFrameMs = (uint32_t)millis();
     s.lastWarnMs  = 0;
     s.parser.idx  = 0;
-
-    Serial.printf("UART init %s: RX=%d TX=%d\n", s.name, s.rx_pin, s.tx_pin);
   }
 
   heartbeat.start();
@@ -445,6 +472,9 @@ void setup() {
 // ============================================================================
 void loop() {
   const uint32_t nowMs = (uint32_t)millis();
+
+  // Keep PacketSerial RX state machine running
+  packetSerial.update();
 
   // 1) Poll both sensors
   for (auto& s : sensors) {
@@ -477,21 +507,5 @@ void loop() {
   if (ledIsOn && ledOffTimer.check()) {
     digitalWrite(LED_PIN, LOW);
     ledIsOn = false;
-  }
-
-  // 5) Status 1x/s (Serial)
-  if ((uint32_t)(nowMs - lastStatusMs) >= 1000) {
-    lastStatusMs = nowMs;
-
-    Serial.printf("Status: BLE=%s last_len=%lu "
-                  "L=%.2fm Amp=%u Temp=%.1fC | R=%.2fm Amp=%u Temp=%.1fC\n",
-                  g_bleConnected ? "ON" : "OFF",
-                  (unsigned long)g_last_send_len,
-                  (double)sensors[IDX_LEFT].distance_m,
-                  (unsigned)sensors[IDX_LEFT].strength,
-                  (double)sensors[IDX_LEFT].temp_c,
-                  (double)sensors[IDX_RIGHT].distance_m,
-                  (unsigned)sensors[IDX_RIGHT].strength,
-                  (double)sensors[IDX_RIGHT].temp_c);
   }
 }
