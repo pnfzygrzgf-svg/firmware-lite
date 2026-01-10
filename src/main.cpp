@@ -11,16 +11,39 @@
 
 #include <esp_timer.h>   // esp_timer_get_time(): 64-bit uptime (µs since boot)
 
+#include <PacketSerial.h>
+
 #include "openbikesensor.pb.h"
 
 // ============================================================================
-// Ultraschall-FW (clean minimal)
+// Ultraschall-FW (BLE + USB)
 // - 2x HC-SR04/JSN-SR04T (Trigger/Echo)
-// - BLE notify (OBS Lite Nordic UART UUIDs)
+// - Sends OpenBikeSensor protobuf Events via:
+//     (A) BLE notify (OBS Lite Nordic UART UUIDs)
+//     (B) USB cable (PacketSerial / SLIP framing) for Android USB-Serial
 // - Protobuf Events: DistanceMeasurement + Heartbeat + UserInput
-// - Zeit: monotonic uptime, reference = ARBITRARY (keine Fake-UNIX-Zeit)
-// - Debug: ganz normal via Serial (USB-Kabel) möglich
+// - Zeit: monotonic uptime, reference = ARBITRARY
+//
+// IMPORTANT:
+// - When PacketSerial uses Serial (USB), DO NOT print debug text to Serial,
+//   otherwise you corrupt the SLIP stream.
+// - If you want debug logs, enable DEBUG_TO_SERIAL1 and wire a USB-UART adapter
+//   to the defined pins.
 // ============================================================================
+
+// ------------------------- Debug config -------------------------
+#define DEBUG_TO_SERIAL1 0
+#if DEBUG_TO_SERIAL1
+  static constexpr int DBG_RX_PIN = 16;   // optional: connect external USB-UART RX here
+  static constexpr int DBG_TX_PIN = 17;   // optional: connect external USB-UART TX here
+  static constexpr uint32_t DBG_BAUD = 115200;
+  HardwareSerial DebugSerial(1);
+  #define DBG_PRINTLN(x) DebugSerial.println(x)
+  #define DBG_PRINTF(...) DebugSerial.printf(__VA_ARGS__)
+#else
+  #define DBG_PRINTLN(x) do {} while (0)
+  #define DBG_PRINTF(...) do {} while (0)
+#endif
 
 // ------------------------- Pins / Config -------------------------
 static constexpr int PUSHBUTTON_PIN = 2;
@@ -40,6 +63,14 @@ static constexpr const char* DEV_LOCAL_NAME = "OpenBikeSensor";
 
 // Protobuf encode buffer
 static constexpr size_t PB_BUFFER_SIZE = 1024;
+
+// ------------------------- PacketSerial (USB) -------------------------
+PacketSerial packetSerial; // uses Serial internally (USB-UART)
+
+// We don't need RX packets right now, but keep handler to avoid surprises.
+static void onSerialPacket(const uint8_t* /*buffer*/, size_t /*size*/) {
+  // no-op
+}
 
 // ------------------------- Wrap-safe helpers -------------------------
 // micros()/millis() are uint32 and will overflow; these helpers keep comparisons safe.
@@ -69,11 +100,11 @@ class ObsBleServerCallbacks : public BLEServerCallbacks {
   void onConnect(BLEServer* s) override {
     (void)s;
     g_bleConnected = true;
-    Serial.println("BLE: connected");
+    DBG_PRINTLN("BLE: connected");
   }
   void onDisconnect(BLEServer* s) override {
     g_bleConnected = false;
-    Serial.println("BLE: disconnected -> advertising");
+    DBG_PRINTLN("BLE: disconnected -> advertising");
     s->startAdvertising();
   }
 };
@@ -85,13 +116,18 @@ Button button(PUSHBUTTON_PIN);
 static uint8_t      pb_buffer[PB_BUFFER_SIZE];
 static pb_ostream_t pb_ostream;
 
-// Send one encoded Event via BLE notify.
-// delay(1) helps BLE stack under frequent notifications.
+// Send one encoded Event via:
+// - USB (PacketSerial/SLIP): ALWAYS
+// - BLE notify: when connected
 static inline void send_event_bytes(const uint8_t* data, size_t len) {
+  // USB / cable (Android): SLIP framed packets
+  packetSerial.send(data, len);
+
+  // BLE: unchanged behavior
   if (g_bleConnected && g_bleTxChar != nullptr) {
     g_bleTxChar->setValue((uint8_t*)data, len);
     g_bleTxChar->notify();
-    delay(1);
+    delay(1); // helps BLE stack under frequent notifications
   }
 }
 
@@ -103,11 +139,11 @@ static inline bool encode_and_send(openbikesensor_Event& event) {
   pb_ostream = pb_ostream_from_buffer(pb_buffer, sizeof(pb_buffer));
   const bool ok = pb_encode(&pb_ostream, &openbikesensor_Event_msg, &event);
   if (!ok) {
-    Serial.printf("PB ENCODE FAILED: %s\n", PB_GET_ERROR(&pb_ostream));
+    DBG_PRINTF("PB ENCODE FAILED: %s\n", PB_GET_ERROR(&pb_ostream));
     return false;
   }
   if (pb_ostream.bytes_written == 0) {
-    Serial.println("PB ENCODE WARNING: bytes_written == 0 (not sending)");
+    DBG_PRINTLN("PB ENCODE WARNING: bytes_written == 0 (not sending)");
     return false;
   }
 
@@ -313,8 +349,15 @@ void IRAM_ATTR isr_sensor1() { sensors[1].echo_edge(); }
 // setup()
 // ============================================================================
 void setup() {
-  Serial.begin(115200);
+  // USB data output (PacketSerial). Do NOT use Serial prints when enabled.
+  packetSerial.setPacketHandler(&onSerialPacket);
+  packetSerial.begin(115200);
   delay(50);
+
+#if DEBUG_TO_SERIAL1
+  DebugSerial.begin(DBG_BAUD, SERIAL_8N1, DBG_RX_PIN, DBG_TX_PIN);
+  DBG_PRINTLN("DBG: Serial1 ready");
+#endif
 
   // ---- BLE init ----
   BLEDevice::init(DEV_LOCAL_NAME);
@@ -343,13 +386,16 @@ void setup() {
   sensors[1].begin(isr_sensor1);
 
   heartbeat.start();
-  Serial.println("FW: boot OK");
+  DBG_PRINTLN("FW: boot OK");
 }
 
 // ============================================================================
 // loop()
 // ============================================================================
 void loop() {
+  // keep PacketSerial RX state machine running (even if you don't receive anything)
+  packetSerial.update();
+
   // update both sensors (sensor0 is master trigger)
   sensors[0].update(true, sensors[1]);
   sensors[1].update(false, sensors[0]);
