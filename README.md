@@ -1,50 +1,51 @@
-# OpenBikeSensor Lite Firmware
+# OpenBikeSensor Lite Firmware (Fork)
 
-This is the firmware repository for the up-and-coming "Lite" version of the OpenBikeSensor.
+> **Hinweis:** Dieses Repository ist ein **Fork** der OpenBikeSensor Lite Firmware und enthält Erweiterungen.  
+> Dieser Branch (**`firmware-lite-lidar`**) streamt OpenBikeSensor Events über **BLE** und zusätzlich über  
+> **USB-Serial** (PacketSerial/SLIP framing).
 
-If you are looking for the firmware for the existing, "Classic" OpenBikeSensor, you can find it here: https://github.com/openbikesensor/OpenBikeSensorFirmware
+Wenn du die Firmware für den bestehenden „Classic“ OpenBikeSensor suchst, findest du sie hier:  
+https://github.com/openbikesensor/OpenBikeSensorFirmware
 
-The OpenBikeSensor Lite is currently in development and not available to build yet. There are no build instructions, and this firmware, the recording software, data format and enclosure are not completed. Please go over to the [OpenBikeSensor Website](https://www.openbikesensor.org/docs/hardware/) if you're interested in building your own device, it contains all information for the Classic version of the OpenBikeSensor.
+---
 
-## BLE-Datenstream (dieser Fork)
+## Features in diesem Fork/Branch
 
-Dieser Fork streamt OpenBikeSensor-Events über **Bluetooth Low Energy (BLE)** mittels GATT-Notifications.
+### BLE-Datenstream
+OpenBikeSensor-Events werden über **Bluetooth Low Energy (BLE)** via GATT-Notifications im Nordic-UART-Stil gesendet.
 
-### BLE-Gerät
-- Advertising-Name: `OpenBikeSensor`
+- Advertising-Name: `OBS Lite LiDAR`
 - Service UUID: `6e400001-b5a3-f393-e0a9-e50e24dcca9e`
 - TX-Characteristic UUID (Notify): `6e400003-b5a3-f393-e0a9-e50e24dcca9e`
 
-## Lidar (dieser Branch)
-Dieser Branch nutzt anstelle der Ultraschall-Sensoren zwei [TF-Luna](https://en.benewake.com/TFLuna/).
+### USB-Serial Datenstream
+Zusätzlich werden die Events über **USB-Serial** ausgegeben (PacketSerial / SLIP framing), damit Hosts
+(z.B. Android oder Desktop) direkt per Kabel mitlesen können.
 
-## Building
+---
 
-Required: 
-- recent python version installed
-- possibly drivers for usb-serial installed
+## Build & Flash (PlatformIO)
 
-To build and upload to obs-lite do the following:
- 
+Voraussetzungen:
+- Python (aktuell)
+- ggf. USB-Serial Treiber (abhängig vom USB-UART auf deinem ESP32-Board)
+
 > [!NOTE]
-> Some ESP modules will require you to push the boot button at the beginning of the flashing process. Try that in case 
-> you get error messages about connection problems while flashing.
+> Manche ESP32-Boards benötigen beim Flashen den **BOOT**-Button (gedrückt halten, kurz Reset/EN drücken).  
+> Falls Upload-Probleme auftreten: `upload_speed` in `platformio.ini` reduzieren (z.B. `460800` oder `115200`).
 
 ```bash
-# Fork klonen (inkl. Submodules) und den gewünschten Branch auschecken
-git clone --recurse-submodules -b firmware-lite-2-lidar \
+# Fork klonen (inkl. Submodules) und diesen Branch auschecken
+git clone --recurse-submodules -b firmware-lite-lidar \
   https://github.com/pnfzygrzgf-svg/firmware-lite.git
 cd firmware-lite/
 
-# Virtuelle Umgebung erstellen, um die globale Python-Installation nicht zu verändern
+# Virtuelle Umgebung erstellen
 python3 -m venv venv
 
 # PlatformIO installieren
 venv/bin/pip install platformio
 
-# Firmware bauen und auf den OBS-Lite flashen
+# Firmware bauen und flashen
 venv/bin/platformio run -t upload
 ```
-* Attach your ESP32 to the USB Port of your computer.
-* Build and run the PlatformIO project. It should upload the binary, then start running.
-* You should be able to decode the data stream on the serial port using the [OpenBikeSensor Recording Format](https://github.com/openbikesensor/proto), for example with the included [`examples/reader.py`](https://github.com/openbikesensor/proto/blob/main/examples/reader.py) script.
