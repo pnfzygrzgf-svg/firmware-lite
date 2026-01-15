@@ -331,9 +331,15 @@ struct TfLunaSensor {
 
 enum { IDX_LEFT = 0, IDX_RIGHT = 1 };
 
+// ============================================================================
+// VARIANTE A: LEFT/RIGHT LOGISCH TAUSCHEN
+// - LEFT nutzt jetzt den "rechten" UART/Pins
+// - RIGHT nutzt jetzt den "linken" UART/Pins
+// ============================================================================
+
 TfLunaSensor sensors[2] = {
-  TfLunaSensor("LEFT",  1, &TFLeft,  TF_LEFT_RX_PIN,  TF_LEFT_TX_PIN),
-  TfLunaSensor("RIGHT", 2, &TFRight, TF_RIGHT_RX_PIN, TF_RIGHT_TX_PIN)
+  TfLunaSensor("LEFT",  1, &TFRight, TF_RIGHT_RX_PIN, TF_RIGHT_TX_PIN),
+  TfLunaSensor("RIGHT", 2, &TFLeft,  TF_LEFT_RX_PIN,  TF_LEFT_TX_PIN)
 };
 
 static inline void poll_sensor(TfLunaSensor& s, uint32_t nowMs) {
