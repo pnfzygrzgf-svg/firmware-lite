@@ -244,6 +244,12 @@ static constexpr uint16_t AMP_OVEREXPOSE = 0xFFFF;
 static constexpr uint32_t LIDAR_STALE_MS = 600;
 static constexpr uint32_t WARN_COOLDOWN_MS = 30000;
 
+// --- NEW: left-side plausibility + "hold last good value" behavior ---
+static constexpr float    LEFT_MAX_METERS   = 4.0f;
+// How long we keep sending last valid LEFT value after last received frame.
+// If you want "hold forever", set to very large (e.g. 600000).
+static constexpr uint32_t LEFT_HOLD_MS      = 2000;
+
 struct TfLunaParser {
   uint8_t buf[9];
   uint8_t idx = 0;
@@ -320,6 +326,10 @@ struct TfLunaSensor {
   uint16_t         strength = 0;
   float            temp_c = 0.0f;
 
+  // --- NEW: last known good value (for holding) ---
+  float            last_good_distance_m = -1.0f;
+  uint32_t         lastGoodMs = 0;
+
   uint32_t         lastFrameMs = 0;
   uint32_t         lastWarnMs  = 0;
 
@@ -336,7 +346,6 @@ enum { IDX_LEFT = 0, IDX_RIGHT = 1 };
 // - LEFT nutzt jetzt den "rechten" UART/Pins
 // - RIGHT nutzt jetzt den "linken" UART/Pins
 // ============================================================================
-
 TfLunaSensor sensors[2] = {
   TfLunaSensor("LEFT",  1, &TFRight, TF_RIGHT_RX_PIN, TF_RIGHT_TX_PIN),
   TfLunaSensor("RIGHT", 2, &TFLeft,  TF_LEFT_RX_PIN,  TF_LEFT_TX_PIN)
@@ -365,11 +374,21 @@ static inline void poll_sensor(TfLunaSensor& s, uint32_t nowMs) {
     }
 
     validFrames++;
+
     s.distance_m  = d_m;
     s.strength    = amp;
     s.temp_c      = t_c;
     s.has_value   = true;
     s.lastFrameMs = nowMs;
+
+    // --- NEW: update last_good_distance_m only if value is plausible ---
+    if (s.distance_m > 0.0f) {
+      // Left side: ignore >4m as outlier; right side: accept all
+      if (s.source_id != 1 || s.distance_m <= LEFT_MAX_METERS) {
+        s.last_good_distance_m = s.distance_m;
+        s.lastGoodMs = nowMs;
+      }
+    }
   }
 
   if (badChecksums >= 3 && (uint32_t)(nowMs - s.lastWarnMs) > WARN_COOLDOWN_MS) {
@@ -391,7 +410,27 @@ static inline void poll_sensor(TfLunaSensor& s, uint32_t nowMs) {
   }
 }
 
-static inline float export_distance_or_sentinel(const TfLunaSensor& s) {
+// --- NEW: export distance with LEFT "hold last good value" behavior ---
+static inline float export_distance_or_sentinel(const TfLunaSensor& s, uint32_t nowMs) {
+  // Left: if current is missing/outlier, hold last good (for LEFT_HOLD_MS after last good)
+  if (s.source_id == 1) {
+    const bool have_current = (s.has_value && s.distance_m > 0.0f);
+    const bool current_plausible = (have_current && s.distance_m <= LEFT_MAX_METERS);
+
+    if (current_plausible) {
+      return s.distance_m;
+    }
+
+    // hold last good if recent enough
+    if (s.last_good_distance_m > 0.0f && (uint32_t)(nowMs - s.lastGoodMs) <= LEFT_HOLD_MS) {
+      return s.last_good_distance_m;
+    }
+
+    // otherwise sentinel
+    return 99.0f;
+  }
+
+  // Right: original behavior (send current if valid, else sentinel)
   return (s.has_value && s.distance_m > 0.0f) ? s.distance_m : 99.0f;
 }
 
@@ -465,6 +504,10 @@ void setup() {
     s.lastFrameMs = (uint32_t)millis();
     s.lastWarnMs  = 0;
     s.parser.idx  = 0;
+
+    // --- NEW init ---
+    s.last_good_distance_m = -1.0f;
+    s.lastGoodMs = 0;
   }
 
   heartbeat.start();
@@ -496,7 +539,7 @@ void loop() {
   // 3) Send distances at fixed rate
   if (lidarSendTimer.check()) {
     for (const auto& s : sensors) {
-      const float meters = export_distance_or_sentinel(s);
+      const float meters = export_distance_or_sentinel(s, nowMs);
       send_distance_measurement(s.source_id, meters, 0);
     }
     lidarSendTimer.start();
