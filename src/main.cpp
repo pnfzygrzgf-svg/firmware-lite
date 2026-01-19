@@ -26,6 +26,8 @@
 //   without DTR/RTS support OR a handshake from the host.
 // - Therefore default is: USB ALWAYS SENDS (works with read-only Android apps).
 // - If you can make Android send 1 byte on connect, set USB_REQUIRE_KNOCK = 1.
+//
+// VERSION: Fixed sentinel value issue - only valid measurements are sent
 // ============================================================================
 
 // ------------------------- USB behavior switch -------------------------
@@ -36,7 +38,7 @@
 // ------------------------- Device info strings -------------------------
 static constexpr const char* DEV_LOCAL_NAME   = "OBS Lite LiDAR";
 static constexpr const char* DEV_MANUFACTURER = "OpenBikeSensor";
-static constexpr const char* DEV_FW_REV       = "OBS-Lite-LiDAR";
+static constexpr const char* DEV_FW_REV       = "OBS-Lite-LiDAR-v2";
 
 // ------------------------- BLE UUIDs (OBS Lite / Nordic UART style) ----
 static constexpr const char* OBS_BLE_SERVICE_UUID = "6e400001-b5a3-f393-e0a9-e50e24dcca9e";
@@ -244,11 +246,14 @@ static constexpr uint16_t AMP_OVEREXPOSE = 0xFFFF;
 static constexpr uint32_t LIDAR_STALE_MS = 600;
 static constexpr uint32_t WARN_COOLDOWN_MS = 30000;
 
-// --- NEW: left-side plausibility + "hold last good value" behavior ---
+// --- Left-side plausibility + "hold last good value" behavior ---
 static constexpr float    LEFT_MAX_METERS   = 4.0f;
 // How long we keep sending last valid LEFT value after last received frame.
-// If you want "hold forever", set to very large (e.g. 600000).
 static constexpr uint32_t LEFT_HOLD_MS      = 2000;
+
+// --- General validity range for all sensors ---
+static constexpr float    MIN_VALID_METERS  = 0.02f;  // 2cm minimum
+static constexpr float    MAX_VALID_METERS  = 10.0f;  // 10m maximum
 
 struct TfLunaParser {
   uint8_t buf[9];
@@ -326,7 +331,7 @@ struct TfLunaSensor {
   uint16_t         strength = 0;
   float            temp_c = 0.0f;
 
-  // --- NEW: last known good value (for holding) ---
+  // Last known good value (for holding)
   float            last_good_distance_m = -1.0f;
   uint32_t         lastGoodMs = 0;
 
@@ -381,9 +386,9 @@ static inline void poll_sensor(TfLunaSensor& s, uint32_t nowMs) {
     s.has_value   = true;
     s.lastFrameMs = nowMs;
 
-    // --- NEW: update last_good_distance_m only if value is plausible ---
+    // Update last_good_distance_m only if value is plausible
     if (s.distance_m > 0.0f) {
-      // Left side: ignore >4m as outlier; right side: accept all
+      // Left side: ignore >4m as outlier; right side: accept all valid
       if (s.source_id != 1 || s.distance_m <= LEFT_MAX_METERS) {
         s.last_good_distance_m = s.distance_m;
         s.lastGoodMs = nowMs;
@@ -410,9 +415,15 @@ static inline void poll_sensor(TfLunaSensor& s, uint32_t nowMs) {
   }
 }
 
-// --- NEW: export distance with LEFT "hold last good value" behavior ---
-static inline float export_distance_or_sentinel(const TfLunaSensor& s, uint32_t nowMs) {
-  // Left: if current is missing/outlier, hold last good (for LEFT_HOLD_MS after last good)
+// ============================================================================
+// Get valid distance or negative value (= invalid, don't send)
+//
+// Returns:
+//   > 0.0f  : Valid distance in meters -> send event
+//   <= 0.0f : Invalid/no measurement   -> DO NOT send event
+// ============================================================================
+static inline float get_valid_distance_m(const TfLunaSensor& s, uint32_t nowMs) {
+  // Left sensor: special handling with hold-last-good and plausibility check
   if (s.source_id == 1) {
     const bool have_current = (s.has_value && s.distance_m > 0.0f);
     const bool current_plausible = (have_current && s.distance_m <= LEFT_MAX_METERS);
@@ -421,17 +432,29 @@ static inline float export_distance_or_sentinel(const TfLunaSensor& s, uint32_t 
       return s.distance_m;
     }
 
-    // hold last good if recent enough
+    // Hold last good value if recent enough
     if (s.last_good_distance_m > 0.0f && (uint32_t)(nowMs - s.lastGoodMs) <= LEFT_HOLD_MS) {
       return s.last_good_distance_m;
     }
 
-    // otherwise sentinel
-    return 99.0f;
+    // Invalid -> return negative to signal "don't send"
+    return -1.0f;
   }
 
-  // Right: original behavior (send current if valid, else sentinel)
-  return (s.has_value && s.distance_m > 0.0f) ? s.distance_m : 99.0f;
+  // Right sensor: simple validity check
+  if (s.has_value && s.distance_m > 0.0f) {
+    return s.distance_m;
+  }
+
+  // Invalid -> return negative to signal "don't send"
+  return -1.0f;
+}
+
+// ============================================================================
+// Check if distance is within valid range for sending
+// ============================================================================
+static inline bool is_valid_for_sending(float distance_m) {
+  return (distance_m >= MIN_VALID_METERS && distance_m <= MAX_VALID_METERS);
 }
 
 static bool ledIsOn = false;
@@ -505,7 +528,6 @@ void setup() {
     s.lastWarnMs  = 0;
     s.parser.idx  = 0;
 
-    // --- NEW init ---
     s.last_good_distance_m = -1.0f;
     s.lastGoodMs = 0;
   }
@@ -536,11 +558,16 @@ void loop() {
     heartbeat.start();
   }
 
-  // 3) Send distances at fixed rate
+  // 3) Send distances at fixed rate - ONLY VALID VALUES
   if (lidarSendTimer.check()) {
     for (const auto& s : sensors) {
-      const float meters = export_distance_or_sentinel(s, nowMs);
-      send_distance_measurement(s.source_id, meters, 0);
+      const float meters = get_valid_distance_m(s, nowMs);
+      
+      // Only send if value is valid and within reasonable range
+      if (is_valid_for_sending(meters)) {
+        send_distance_measurement(s.source_id, meters, 0);
+      }
+      // If invalid: simply don't send anything - no sentinel value!
     }
     lidarSendTimer.start();
   }
