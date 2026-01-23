@@ -255,6 +255,10 @@ static constexpr uint32_t LEFT_HOLD_MS      = 2000;
 static constexpr float    MIN_VALID_METERS  = 0.02f;  // 2cm minimum
 static constexpr float    MAX_VALID_METERS  = 10.0f;  // 10m maximum
 
+// --- Sensor IDs (avoid hardcoded magic numbers) ---
+static constexpr uint32_t LEFT_SENSOR_ID  = 1;
+static constexpr uint32_t RIGHT_SENSOR_ID = 2;
+
 struct TfLunaParser {
   uint8_t buf[9];
   uint8_t idx = 0;
@@ -352,8 +356,8 @@ enum { IDX_LEFT = 0, IDX_RIGHT = 1 };
 // - RIGHT nutzt jetzt den "linken" UART/Pins
 // ============================================================================
 TfLunaSensor sensors[2] = {
-  TfLunaSensor("LEFT",  1, &TFRight, TF_RIGHT_RX_PIN, TF_RIGHT_TX_PIN),
-  TfLunaSensor("RIGHT", 2, &TFLeft,  TF_LEFT_RX_PIN,  TF_LEFT_TX_PIN)
+  TfLunaSensor("LEFT",  LEFT_SENSOR_ID,  &TFRight, TF_RIGHT_RX_PIN, TF_RIGHT_TX_PIN),
+  TfLunaSensor("RIGHT", RIGHT_SENSOR_ID, &TFLeft,  TF_LEFT_RX_PIN,  TF_LEFT_TX_PIN)
 };
 
 static inline void poll_sensor(TfLunaSensor& s, uint32_t nowMs) {
@@ -387,9 +391,9 @@ static inline void poll_sensor(TfLunaSensor& s, uint32_t nowMs) {
     s.lastFrameMs = nowMs;
 
     // Update last_good_distance_m only if value is plausible
-    if (s.distance_m > 0.0f) {
+    if (s.distance_m >= MIN_VALID_METERS) {
       // Left side: ignore >4m as outlier; right side: accept all valid
-      if (s.source_id != 1 || s.distance_m <= LEFT_MAX_METERS) {
+      if (s.source_id != LEFT_SENSOR_ID || s.distance_m <= LEFT_MAX_METERS) {
         s.last_good_distance_m = s.distance_m;
         s.lastGoodMs = nowMs;
       }
@@ -397,8 +401,9 @@ static inline void poll_sensor(TfLunaSensor& s, uint32_t nowMs) {
   }
 
   if (badChecksums >= 3 && (uint32_t)(nowMs - s.lastWarnMs) > WARN_COOLDOWN_MS) {
-    send_text_message(String("LiDAR ") + s.name + ": " + String(badChecksums) + " checksum errors",
-                      openbikesensor_TextMessage_Type_WARNING);
+    char msgBuf[64];
+    snprintf(msgBuf, sizeof(msgBuf), "LiDAR %s: %d checksum errors", s.name, badChecksums);
+    send_text_message(String(msgBuf), openbikesensor_TextMessage_Type_WARNING);
     s.lastWarnMs = nowMs;
   }
 
@@ -408,8 +413,9 @@ static inline void poll_sensor(TfLunaSensor& s, uint32_t nowMs) {
     s.strength   = 0;
 
     if ((uint32_t)(nowMs - s.lastWarnMs) > WARN_COOLDOWN_MS) {
-      send_text_message(String("LiDAR ") + s.name + ": no frames (UART timeout)",
-                        openbikesensor_TextMessage_Type_WARNING);
+      char msgBuf[64];
+      snprintf(msgBuf, sizeof(msgBuf), "LiDAR %s: no frames (UART timeout)", s.name);
+      send_text_message(String(msgBuf), openbikesensor_TextMessage_Type_WARNING);
       s.lastWarnMs = nowMs;
     }
   }
@@ -424,8 +430,8 @@ static inline void poll_sensor(TfLunaSensor& s, uint32_t nowMs) {
 // ============================================================================
 static inline float get_valid_distance_m(const TfLunaSensor& s, uint32_t nowMs) {
   // Left sensor: special handling with hold-last-good and plausibility check
-  if (s.source_id == 1) {
-    const bool have_current = (s.has_value && s.distance_m > 0.0f);
+  if (s.source_id == LEFT_SENSOR_ID) {
+    const bool have_current = (s.has_value && s.distance_m >= MIN_VALID_METERS && s.distance_m <= MAX_VALID_METERS);
     const bool current_plausible = (have_current && s.distance_m <= LEFT_MAX_METERS);
 
     if (current_plausible) {
@@ -433,7 +439,7 @@ static inline float get_valid_distance_m(const TfLunaSensor& s, uint32_t nowMs) 
     }
 
     // Hold last good value if recent enough
-    if (s.last_good_distance_m > 0.0f && (uint32_t)(nowMs - s.lastGoodMs) <= LEFT_HOLD_MS) {
+    if (s.last_good_distance_m >= MIN_VALID_METERS && (uint32_t)(nowMs - s.lastGoodMs) <= LEFT_HOLD_MS) {
       return s.last_good_distance_m;
     }
 
@@ -441,8 +447,8 @@ static inline float get_valid_distance_m(const TfLunaSensor& s, uint32_t nowMs) 
     return -1.0f;
   }
 
-  // Right sensor: simple validity check
-  if (s.has_value && s.distance_m > 0.0f) {
+  // Right sensor: validity check with range limits
+  if (s.has_value && s.distance_m >= MIN_VALID_METERS && s.distance_m <= MAX_VALID_METERS) {
     return s.distance_m;
   }
 
@@ -481,7 +487,8 @@ void setup() {
   BLEDevice::init(DEV_LOCAL_NAME);
 
   g_bleServer = BLEDevice::createServer();
-  g_bleServer->setCallbacks(new ObsBleServerCallbacks());
+  static ObsBleServerCallbacks bleCallbacks;
+  g_bleServer->setCallbacks(&bleCallbacks);
 
   BLEService* obsService = g_bleServer->createService(OBS_BLE_SERVICE_UUID);
 
@@ -519,17 +526,8 @@ void setup() {
   // ---- TF-Luna UARTs ----
   for (auto& s : sensors) {
     s.port->begin(115200, SERIAL_8N1, s.rx_pin, s.tx_pin);
-
-    s.has_value   = false;
-    s.distance_m  = -1.0f;
-    s.strength    = 0;
-    s.temp_c      = 0.0f;
-    s.lastFrameMs = (uint32_t)millis();
-    s.lastWarnMs  = 0;
-    s.parser.idx  = 0;
-
-    s.last_good_distance_m = -1.0f;
-    s.lastGoodMs = 0;
+    s.lastFrameMs = (uint32_t)millis();  // Runtime-dependent, needs millis()
+    s.parser.idx  = 0;                   // Reset parser state
   }
 
   heartbeat.start();
