@@ -54,6 +54,10 @@ static constexpr uint8_t SENSOR0_ECHO_PIN = 4;
 static constexpr uint8_t SENSOR1_TRIG_PIN = 25;
 static constexpr uint8_t SENSOR1_ECHO_PIN = 26;
 
+// Sensor IDs (avoid hardcoded magic numbers)
+static constexpr uint8_t LEFT_SENSOR_ID  = 1;
+static constexpr uint8_t RIGHT_SENSOR_ID = 2;
+
 // BLE UUIDs (OBS Lite / Nordic UART style)
 static constexpr const char* OBS_BLE_SERVICE_UUID = "6e400001-b5a3-f393-e0a9-e50e24dcca9e";
 static constexpr const char* OBS_BLE_CHAR_TX_UUID = "6e400003-b5a3-f393-e0a9-e50e24dcca9e";
@@ -336,8 +340,8 @@ public:
 
 // Two sensors
 Sensor sensors[] = {
-  Sensor(1, SENSOR0_TRIG_PIN, SENSOR0_ECHO_PIN),
-  Sensor(2, SENSOR1_TRIG_PIN, SENSOR1_ECHO_PIN),
+  Sensor(LEFT_SENSOR_ID,  SENSOR0_TRIG_PIN, SENSOR0_ECHO_PIN),
+  Sensor(RIGHT_SENSOR_ID, SENSOR1_TRIG_PIN, SENSOR1_ECHO_PIN),
 };
 static constexpr uint8_t SENSORS_LEN = sizeof(sensors) / sizeof(sensors[0]);
 
@@ -363,7 +367,8 @@ void setup() {
   BLEDevice::init(DEV_LOCAL_NAME);
 
   g_bleServer = BLEDevice::createServer();
-  g_bleServer->setCallbacks(new ObsBleServerCallbacks());
+  static ObsBleServerCallbacks bleCallbacks;
+  g_bleServer->setCallbacks(&bleCallbacks);
 
   BLEService* svc = g_bleServer->createService(OBS_BLE_SERVICE_UUID);
 
@@ -371,7 +376,8 @@ void setup() {
     OBS_BLE_CHAR_TX_UUID,
     BLECharacteristic::PROPERTY_NOTIFY
   );
-  g_bleTxChar->addDescriptor(new BLE2902());
+  static BLE2902 ble2902Descriptor;
+  g_bleTxChar->addDescriptor(&ble2902Descriptor);
   svc->start();
 
   BLEAdvertising* adv = BLEDevice::getAdvertising();
@@ -406,21 +412,18 @@ void loop() {
     heartbeat.start();
   }
 
-  // send measurements when available
+  // send measurements when available (only valid ones, no sentinel values)
   for (uint8_t i = 0; i < SENSORS_LEN; i++) {
     Sensor& s = sensors[i];
     if (!s.has_new) continue;
 
-    // invalid sentinel
-    double distance_m = 99.0;
-    uint64_t tof_ns   = 0;
-
     if (!s.meas.timeout) {
-      distance_m = s.meas.distance_m();
-      tof_ns     = (uint64_t)s.meas.tof_us * 1000ULL; // µs -> ns
+      const double distance_m = s.meas.distance_m();
+      const uint64_t tof_ns = (uint64_t)s.meas.tof_us * 1000ULL; // µs -> ns
+      send_distance_measurement(s.source_id, (float)distance_m, tof_ns);
     }
+    // Bei Timeout: nichts senden (kein Sentinel-Wert)
 
-    send_distance_measurement(s.source_id, (float)distance_m, tof_ns);
     s.has_new = false;
   }
 
