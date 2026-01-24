@@ -218,7 +218,7 @@ public:
   // Convert ToF to meters using temperature-based speed of sound
   double distance_m(double temperature_c = 19.307) const {
     const double speedOfSound = 20.05 * sqrt(273.16 + temperature_c); // m/s
-    return speedOfSound * (double)tof_us / 1'000'000.0 / 2.0;
+    return speedOfSound * (double)tof_us / 1000000.0 / 2.0;
   }
 };
 
